@@ -69,6 +69,7 @@ tools/
 - [M2 control plane](docs/control_plane_m2.md)
 - [M2 control plane plan](docs/musubi_m_2_control_plane_plan.md)
 - [M2.5 Codex adapter](docs/codex_adapter_m2_5.md)
+- [M3.5 browser/session keys](docs/browser_session_keys_m3_5.md)
 - [Hosted M1 deployment](docs/hosted_m1_deployment.md)
 - [Repository policy](docs/policy.md)
 
@@ -303,6 +304,16 @@ bun run verify:m3-app-sdk
 ```
 
 The verifier covers encrypted SDK invoke/events/result/cancel flows, hashed API keys, app-key scoping, revocation, and plaintext-free server records.
+
+### M3.5 Browser Session Verification
+
+Run the Hermes Companion browser-session verifier:
+
+```bash
+bun run verify:m3.5-browser-session
+```
+
+The verifier proves browser task start, authenticated SSE events, cancellation, reconnect, user scoping, browser-safe errors, backend log hygiene, and that the browser never receives `MUSUBI_API_KEY` or `MUSUBI_APP_PRIVATE_KEY`.
 
 ### Message States
 

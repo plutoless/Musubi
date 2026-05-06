@@ -34,6 +34,7 @@
     "verify:m2-control-plane": "bun run tools/verify_m2_control_plane.ts",
     "verify:m2.5-codex": "bun run tools/verify_m2_5_codex_adapter.ts",
     "verify:m3-app-sdk": "bun run tools/verify_m3_app_sdk.ts",
+    "verify:m3.5-browser-session": "bun run tools/verify_m3_5_browser_session.ts",
     "verify:m1-readiness": "bun run tools/verify_m1_readiness.ts"
   },
   "devDependencies": {},

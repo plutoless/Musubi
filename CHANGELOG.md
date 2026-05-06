@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added the M3.5 Hermes Companion browser-session reference app, App SDK event bridge helper, browser client, docs, and verifier.
 - Added the M3 TypeScript App SDK, user-owned app CLI creation, app-scoped API keys, SDK docs, and verifier.
 - Added the M2.5 real Codex adapter contract, workspace-policy validation, streaming event support, and verifier.
 - Added the M2 control plane plan, product contract, local control-plane UI, backend APIs, revoke semantics, and verifier.

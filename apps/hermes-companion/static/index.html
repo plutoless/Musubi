@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Companion</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace">
+        <div class="topline">
+          <div>
+            <p class="eyebrow">Hermes Companion</p>
+            <h1>Run approved local Hermes tasks</h1>
+          </div>
+          <span id="status" class="badge">Disconnected</span>
+        </div>
+        <form id="task-form" class="task-form">
+          <label>Device<select id="device"></select></label>
+          <label>Workspace hint<input id="workspace" autocomplete="off" placeholder="~/projects/demo" /></label>
+          <label class="instruction">Instruction<textarea id="instruction" rows="5" required>Check the project and summarize the current status.</textarea></label>
+          <p class="notice">Hermes will ask your local Musubi device to run the Hermes plugin. Musubi routes encrypted messages and cannot read task contents. Your local policy can still deny the request.</p>
+          <div class="actions">
+            <button class="primary" type="submit">Run</button>
+            <button id="cancel" type="button" disabled>Cancel</button>
+          </div>
+        </form>
+      </section>
+      <section class="stream-panel">
+        <div class="panel-head">
+          <h2>Task Stream</h2>
+          <span id="task-id"></span>
+        </div>
+        <div id="events" class="events"></div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
