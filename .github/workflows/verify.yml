@@ -58,6 +58,7 @@ jobs:
           bun run verify:slice12
           bun run verify:slice12:runtime
           bun run verify:slice13
+          bun run verify:m2-control-plane
 
       - name: Verify hosted Worker build
         run: bun run verify:slice11:build

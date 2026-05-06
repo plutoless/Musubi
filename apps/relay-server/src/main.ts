@@ -15,6 +15,10 @@ interface StoredMessage {
   status: MessageState;
   result?: ResultEnvelope;
   history: MessageState[];
+  created_at: string;
+  updated_at: string;
+  error_code?: string;
+  error_message?: string;
 }
 
 interface DeviceRecord {
@@ -22,11 +26,16 @@ interface DeviceRecord {
   workspace_id: string;
   owner_user_id: string;
   name: string;
+  display_name?: string;
+  description?: string;
   platform: string;
   cli_version: string;
-  status: "offline" | "online";
+  status: "offline" | "online" | "revoked";
   created_at: string;
   last_seen_at?: string;
+  last_capability_report_at?: string;
+  revoked_at?: string;
+  revoked_by?: string;
 }
 
 interface DeviceKeyRecord {
@@ -42,9 +51,14 @@ interface AppRecord {
   id: string;
   workspace_id: string;
   name: string;
+  description?: string;
   type: "first_party" | "user_owned";
   status: "active" | "revoked";
   created_at: string;
+  disabled_at?: string;
+  disabled_by?: string;
+  revoked_at?: string;
+  revoked_by?: string;
 }
 
 interface AppKeyRecord {
@@ -60,10 +74,14 @@ interface GrantRecord {
   workspace_id: string;
   app_id: string;
   device_id: string;
+  name?: string;
+  description?: string;
   allowed_channels: string[];
   queueing_allowed: boolean;
   created_at: string;
+  updated_at?: string;
   revoked_at?: string;
+  revoked_by?: string;
 }
 
 interface AuditEventRecord {
@@ -92,6 +110,18 @@ interface DevicePluginCapabilityRecord {
   reported_at: string;
 }
 
+interface MessageStatusEventRecord {
+  id: string;
+  message_id: string;
+  workspace_id: string;
+  status: MessageState;
+  stage?: string;
+  error_code?: string;
+  error_message?: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
 export function startRelay(options: { hostname?: string; port?: number } = {}) {
   const messages = new Map<string, StoredMessage>();
   const devices = new Map<string, DeviceRecord>();
@@ -101,22 +131,57 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
   const grants = new Map<string, GrantRecord>();
   const capabilities: DevicePluginCapabilityRecord[] = [];
   const auditEvents: AuditEventRecord[] = [];
+  const messageStatusEvents: MessageStatusEventRecord[] = [];
   let deviceSocket: DeviceSocket | undefined;
 
-  function transition(messageId: string, status: MessageState) {
+  function transition(messageId: string, status: MessageState, fields: { error_code?: string; error_message?: string } = {}) {
     const item = messages.get(messageId);
     if (!item) return;
     item.status = status;
     item.history.push(status);
+    item.updated_at = new Date().toISOString();
+    item.error_code = fields.error_code;
+    item.error_message = fields.error_message;
+    recordStatusEvent(item, status, fields);
     audit("system", undefined, `message.${status}`, {
       workspace_id: item.envelope.workspace_id,
       app_id: item.envelope.app_id,
       device_id: item.envelope.device_id,
       message_id: messageId,
       channel: item.envelope.channel,
-      metadata: { status, ciphertext_bytes: Buffer.byteLength(item.envelope.ciphertext, "utf8") },
+      metadata: {
+        status,
+        ciphertext_bytes: Buffer.byteLength(item.envelope.ciphertext, "utf8"),
+        ...(fields.error_code ? { error_code: fields.error_code } : {}),
+        ...(fields.error_message ? { error_message: fields.error_message } : {}),
+      },
     });
     console.log("[relay] status", { message_id: messageId, status });
+  }
+
+  function recordStatusEvent(item: StoredMessage, status: MessageState, fields: { error_code?: string; error_message?: string } = {}) {
+    messageStatusEvents.push({
+      id: `mse_${String(messageStatusEvents.length + 1).padStart(6, "0")}`,
+      message_id: item.envelope.message_id,
+      workspace_id: item.envelope.workspace_id,
+      status,
+      stage: statusToStage(status),
+      error_code: fields.error_code,
+      error_message: fields.error_message,
+      metadata: {
+        channel: item.envelope.channel,
+        ciphertext_bytes: Buffer.byteLength(item.envelope.ciphertext, "utf8"),
+      },
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  function statusToStage(status: MessageState) {
+    if (status === "created" || status === "validated") return "authorization";
+    if (status === "queued" || status === "delivered") return "routing";
+    if (status === "received" || status === "processing") return "device";
+    if (status === "completed" || status === "failed" || status === "cancelled") return "terminal";
+    return "lifecycle";
   }
 
   function audit(
@@ -169,6 +234,11 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     if (!app || app.status !== "active") return "app denied";
     const device = devices.get(deviceId);
     if (!device) return "device denied";
+    if (device.status === "revoked") return "device revoked";
+    const activeAppKey = [...appKeys.values()].find((key) => key.app_id === appId && key.status === "active");
+    if (!activeAppKey) return "app key denied";
+    const activeDeviceKey = [...deviceKeys.values()].find((key) => key.device_id === deviceId && key.status === "active");
+    if (!activeDeviceKey) return "device key denied";
     const activeGrant = [...grants.values()].find(
       (grant) =>
         grant.workspace_id === workspaceId &&
@@ -212,7 +282,10 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       envelope,
       status: "created",
       history: ["created"],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     });
+    recordStatusEvent(messages.get(envelope.message_id)!, "created");
     audit("app", envelope.app_id, "message.created", {
       workspace_id: envelope.workspace_id,
       app_id: envelope.app_id,
@@ -224,13 +297,13 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     console.log("[relay] message created", visibleEnvelopeLog(envelope));
 
     if (isExpired(envelope)) {
-      transition(envelope.message_id, "expired");
+      transition(envelope.message_id, "expired", { error_code: "MESSAGE_EXPIRED", error_message: "message expired" });
       return Response.json({ message_id: envelope.message_id, status: "expired", error: "message expired" }, { status: 410 });
     }
 
     const denied = authorize(envelope);
     if (denied) {
-      transition(envelope.message_id, "failed");
+      transition(envelope.message_id, "failed", { error_code: "AUTHORIZATION_DENIED", error_message: denied });
       return Response.json(
         { message_id: envelope.message_id, status: "failed", error: denied },
         { status: 403 },
@@ -244,7 +317,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         transition(envelope.message_id, "queued");
         return Response.json({ message_id: envelope.message_id, status: "queued" });
       }
-      transition(envelope.message_id, "failed");
+      transition(envelope.message_id, "failed", { error_code: "DEVICE_OFFLINE", error_message: "device offline" });
       return Response.json(
         { message_id: envelope.message_id, status: "failed", error: "device offline" },
         { status: 409 },
@@ -278,6 +351,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       cli_version: body.cli_version,
       status: "offline",
       created_at: now,
+      last_capability_report_at: undefined,
     };
     const key: DeviceKeyRecord = {
       id: keyId,
@@ -322,6 +396,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
   async function verifyDeviceConnection(req: Request, deviceId: string): Promise<string | undefined> {
     const device = devices.get(deviceId);
     if (!device) return "unknown device";
+    if (device.status === "revoked") return "device revoked";
     const activeKey = [...deviceKeys.values()].find(
       (key) => key.device_id === deviceId && key.status === "active",
     );
@@ -400,6 +475,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       device_id: string;
       allowed_channels: string[];
       queueing_allowed?: boolean;
+      name?: string;
+      description?: string;
     };
     const denied = checkGrantPreconditions(body.workspace_id, body.app_id, body.device_id);
     if (denied) return Response.json({ status: "failed", error: denied }, { status: 400 });
@@ -411,9 +488,12 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       workspace_id: body.workspace_id,
       app_id: body.app_id,
       device_id: body.device_id,
+      name: body.name,
+      description: body.description,
       allowed_channels: body.allowed_channels,
       queueing_allowed: body.queueing_allowed ?? false,
       created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     };
     grants.set(grantId, grant);
     audit("user", "user_local", "grant.created", {
@@ -428,7 +508,12 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       device_id: body.device_id,
       allowed_channels: body.allowed_channels,
     });
-    return Response.json({ grant_id: grantId, status: "active" });
+    return Response.json({
+      grant_id: grantId,
+      status: "active",
+      grant: grantView(grant),
+      warning: supportedChannelWarning(grant.device_id, grant.allowed_channels),
+    });
   }
 
   function checkGrantPreconditions(workspaceId: string, appId: string, deviceId: string) {
@@ -436,6 +521,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     if (!app || app.workspace_id !== workspaceId || app.status !== "active") return "app denied";
     const device = devices.get(deviceId);
     if (!device || device.workspace_id !== workspaceId) return "device denied";
+    if (device.status === "revoked") return "device revoked";
     return undefined;
   }
 
@@ -454,6 +540,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
   async function handleReportCapabilities(req: Request, deviceId: string): Promise<Response> {
     const device = devices.get(deviceId);
     if (!device) return Response.json({ error: "not found" }, { status: 404 });
+    if (device.status === "revoked") return Response.json({ error: "device revoked" }, { status: 403 });
     const body = (await req.json()) as {
       plugins: Array<{
         name: string;
@@ -464,6 +551,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }>;
     };
     const now = new Date().toISOString();
+    device.last_capability_report_at = now;
     for (const plugin of body.plugins ?? []) {
       capabilities.push({
         id: `cap_${String(capabilities.length + 1).padStart(6, "0")}`,
@@ -503,19 +591,251 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     return Response.json({ message_id: messageId, status: "cancelled" });
   }
 
+  function paginate<T>(items: T[], url: URL) {
+    const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit") ?? 50), 100));
+    const cursor = Math.max(0, Number(url.searchParams.get("cursor") ?? 0));
+    const page = items.slice(cursor, cursor + limit);
+    const next_cursor = cursor + limit < items.length ? String(cursor + limit) : null;
+    return { page, next_cursor };
+  }
+
+  function latestCapabilitiesFor(deviceId: string) {
+    const byPlugin = new Map<string, DevicePluginCapabilityRecord>();
+    for (const capability of capabilities.filter((item) => item.device_id === deviceId)) {
+      const existing = byPlugin.get(capability.plugin_name);
+      if (!existing || existing.reported_at < capability.reported_at) {
+        byPlugin.set(capability.plugin_name, capability);
+      }
+    }
+    return [...byPlugin.values()].sort((a, b) => a.plugin_name.localeCompare(b.plugin_name));
+  }
+
+  function grantView(grant: GrantRecord) {
+    return {
+      ...grant,
+      status: grant.revoked_at ? "revoked" : "active",
+      app: apps.get(grant.app_id),
+      device: devices.get(grant.device_id),
+    };
+  }
+
+  function messageView(item: StoredMessage) {
+    const created = Date.parse(item.created_at);
+    const updated = Date.parse(item.updated_at);
+    return {
+      id: item.envelope.message_id,
+      message_id: item.envelope.message_id,
+      workspace_id: item.envelope.workspace_id,
+      app_id: item.envelope.app_id,
+      app_name: apps.get(item.envelope.app_id)?.name,
+      device_id: item.envelope.device_id,
+      device_name: devices.get(item.envelope.device_id)?.name,
+      channel: item.envelope.channel,
+      status: item.status,
+      created_at: item.created_at,
+      updated_at: item.updated_at,
+      duration_ms: Number.isFinite(created) && Number.isFinite(updated) ? Math.max(0, updated - created) : null,
+      ttl_seconds: item.envelope.metadata?.ttl_seconds,
+      crypto: {
+        version: item.envelope.crypto?.version,
+        alg: item.envelope.crypto?.alg,
+        sender_key_id: item.envelope.crypto?.sender_key_id,
+        recipient_key_id: item.envelope.crypto?.recipient_key_id,
+        payload_size: Buffer.byteLength(item.envelope.ciphertext, "utf8"),
+      },
+      error_code: item.error_code,
+      error_message: item.error_message,
+    };
+  }
+
+  function listMessages(url: URL) {
+    let rows = [...messages.values()].map(messageView).sort((a, b) => b.created_at.localeCompare(a.created_at));
+    for (const field of ["app_id", "device_id", "channel", "status"] as const) {
+      const value = url.searchParams.get(field);
+      if (value) rows = rows.filter((row) => row[field] === value);
+    }
+    const { page, next_cursor } = paginate(rows, url);
+    return Response.json({ messages: page, next_cursor });
+  }
+
+  function listAuditEvents(url: URL) {
+    let rows = [...auditEvents].sort((a, b) => b.created_at.localeCompare(a.created_at));
+    for (const field of ["event_type", "app_id", "device_id", "message_id", "actor_id"] as const) {
+      const value = url.searchParams.get(field);
+      if (value) rows = rows.filter((row) => row[field] === value);
+    }
+    const { page, next_cursor } = paginate(rows, url);
+    return Response.json({ audit_events: page, next_cursor });
+  }
+
+  function supportedChannelWarning(deviceId: string, requestedChannels: string[]) {
+    const reported = new Set(latestCapabilitiesFor(deviceId).flatMap((capability) => capability.channels));
+    if (reported.size === 0) return "device has not reported capabilities yet";
+    const unsupported = requestedChannels.filter((channel) => !reported.has(channel));
+    return unsupported.length > 0 ? `channels not reported by device capabilities: ${unsupported.join(", ")}` : undefined;
+  }
+
+  async function handleUpdateGrant(req: Request, grantId: string): Promise<Response> {
+    const grant = grants.get(grantId);
+    if (!grant) return Response.json({ error: "not found" }, { status: 404 });
+    if (grant.revoked_at) return Response.json({ error: "grant revoked" }, { status: 409 });
+    const body = (await req.json()) as {
+      allowed_channels?: string[];
+      queueing_allowed?: boolean;
+      description?: string;
+      name?: string;
+    };
+    if (body.allowed_channels) grant.allowed_channels = body.allowed_channels;
+    if (body.queueing_allowed !== undefined) grant.queueing_allowed = body.queueing_allowed;
+    if (body.description !== undefined) grant.description = body.description;
+    if (body.name !== undefined) grant.name = body.name;
+    grant.updated_at = new Date().toISOString();
+    audit("user", "user_local", "grant.updated", {
+      workspace_id: grant.workspace_id,
+      app_id: grant.app_id,
+      device_id: grant.device_id,
+      metadata: { grant_id: grant.id, allowed_channels: grant.allowed_channels },
+    });
+    return Response.json({ grant: grantView(grant), warning: supportedChannelWarning(grant.device_id, grant.allowed_channels) });
+  }
+
+  function handleRevokeGrant(grantId: string): Response {
+    const grant = grants.get(grantId);
+    if (!grant) return Response.json({ error: "not found" }, { status: 404 });
+    grant.revoked_at = new Date().toISOString();
+    grant.revoked_by = "user_local";
+    grant.updated_at = grant.revoked_at;
+    audit("user", "user_local", "grant.revoked", {
+      workspace_id: grant.workspace_id,
+      app_id: grant.app_id,
+      device_id: grant.device_id,
+      metadata: { grant_id: grant.id },
+    });
+    console.log("[relay] grant revoked", { grant_id: grant.id });
+    return Response.json({ grant_id: grant.id, status: "revoked" });
+  }
+
+  function handleRevokeApp(appId: string): Response {
+    const app = apps.get(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    app.status = "revoked";
+    app.revoked_at = new Date().toISOString();
+    app.revoked_by = "user_local";
+    for (const key of appKeys.values()) {
+      if (key.app_id === appId && key.status === "active") key.status = "revoked";
+    }
+    for (const grant of grants.values()) {
+      if (grant.app_id === appId && !grant.revoked_at) {
+        grant.revoked_at = app.revoked_at;
+        grant.revoked_by = "user_local";
+        grant.updated_at = app.revoked_at;
+      }
+    }
+    audit("user", "user_local", "app.revoked", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_id: app.id },
+    });
+    return Response.json({ app_id: app.id, status: app.status });
+  }
+
+  function handleRevokeDevice(deviceId: string): Response {
+    const device = devices.get(deviceId);
+    if (!device) return Response.json({ error: "not found" }, { status: 404 });
+    device.status = "revoked";
+    device.revoked_at = new Date().toISOString();
+    device.revoked_by = "user_local";
+    device.last_seen_at = device.revoked_at;
+    for (const key of deviceKeys.values()) {
+      if (key.device_id === deviceId && key.status === "active") key.status = "revoked";
+    }
+    if (deviceSocket?.data.deviceId === deviceId) {
+      deviceSocket.close(4001, "device revoked");
+      deviceSocket = undefined;
+    }
+    audit("user", "user_local", "device.revoked", {
+      workspace_id: device.workspace_id,
+      device_id: device.id,
+      metadata: { device_id: device.id },
+    });
+    return Response.json({ device_id: device.id, status: device.status });
+  }
+
+  async function serveControlPlane(pathname: string): Promise<Response> {
+    const filePath = pathname === "/control-plane/app.js"
+      ? "apps/control-plane/app.js"
+      : pathname === "/control-plane/styles.css"
+        ? "apps/control-plane/styles.css"
+        : "apps/control-plane/index.html";
+    const file = Bun.file(filePath);
+    if (!(await file.exists())) return new Response("not found", { status: 404 });
+    const contentType = filePath.endsWith(".js")
+      ? "application/javascript; charset=utf-8"
+      : filePath.endsWith(".css")
+        ? "text/css; charset=utf-8"
+        : "text/html; charset=utf-8";
+    return new Response(file, { headers: { "Content-Type": contentType } });
+  }
+
   const server = Bun.serve({
     hostname: options.hostname ?? process.env.MUSUBI_RELAY_HOST ?? "127.0.0.1",
     port: options.port ?? Number(process.env.MUSUBI_RELAY_PORT ?? "8787"),
     fetch(req, server) {
       const url = new URL(req.url);
 
+      if (url.pathname === "/" && req.method === "GET") {
+        return Response.redirect(`${url.origin}/control-plane`, 302);
+      }
+
+      if (url.pathname === "/control-plane" || url.pathname.startsWith("/control-plane/")) {
+        return serveControlPlane(url.pathname);
+      }
+
       const connectMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/connect$/);
       if (connectMatch) {
         return handleDeviceConnect(req, server, connectMatch[1]);
       }
 
+      if (url.pathname === "/v1/devices" && req.method === "GET") {
+        let rows = [...devices.values()]
+          .filter((device) => !url.searchParams.get("workspace_id") || device.workspace_id === url.searchParams.get("workspace_id"))
+          .filter((device) => !url.searchParams.get("status") || device.status === url.searchParams.get("status"))
+          .map((device) => ({
+            id: device.id,
+            name: device.display_name ?? device.name,
+            status: device.status,
+            platform: device.platform,
+            cli_version: device.cli_version,
+            plugin_count: latestCapabilitiesFor(device.id).length,
+            authorized_app_count: new Set([...grants.values()].filter((grant) => grant.device_id === device.id && !grant.revoked_at).map((grant) => grant.app_id)).size,
+            last_seen_at: device.last_seen_at,
+            last_capability_report_at: device.last_capability_report_at,
+            created_at: device.created_at,
+          }))
+          .sort((a, b) => a.id.localeCompare(b.id));
+        const { page, next_cursor } = paginate(rows, url);
+        return Response.json({ devices: page, next_cursor });
+      }
+
       if (url.pathname === "/v1/devices/register" && req.method === "POST") {
         return handleRegisterDevice(req);
+      }
+
+      if (url.pathname === "/v1/apps" && req.method === "GET") {
+        const rows = [...apps.values()].map((app) => {
+          const activeGrants = [...grants.values()].filter((grant) => grant.app_id === app.id && !grant.revoked_at);
+          return {
+            id: app.id,
+            name: app.name,
+            type: app.type,
+            status: app.status,
+            authorized_device_count: new Set(activeGrants.map((grant) => grant.device_id)).size,
+            allowed_channel_count: new Set(activeGrants.flatMap((grant) => grant.allowed_channels)).size,
+            created_at: app.created_at,
+          };
+        }).sort((a, b) => a.id.localeCompare(b.id));
+        const { page, next_cursor } = paginate(rows, url);
+        return Response.json({ apps: page, next_cursor });
       }
 
       if (url.pathname === "/v1/apps" && req.method === "POST") {
@@ -537,17 +857,32 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
 
       const grantRevokeMatch = url.pathname.match(/^\/v1\/grants\/([^/]+)\/revoke$/);
       if (grantRevokeMatch && req.method === "POST") {
-        const grant = grants.get(grantRevokeMatch[1]);
-        if (!grant) return Response.json({ error: "not found" }, { status: 404 });
-        grant.revoked_at = new Date().toISOString();
-        audit("user", "user_local", "grant.revoked", {
-          workspace_id: grant.workspace_id,
-          app_id: grant.app_id,
-          device_id: grant.device_id,
-          metadata: { grant_id: grant.id },
-        });
-        console.log("[relay] grant revoked", { grant_id: grant.id });
-        return Response.json({ grant_id: grant.id, status: "revoked" });
+        return handleRevokeGrant(grantRevokeMatch[1]);
+      }
+
+      const grantPatchMatch = url.pathname.match(/^\/v1\/grants\/([^/]+)$/);
+      if (grantPatchMatch && req.method === "PATCH") {
+        return handleUpdateGrant(req, grantPatchMatch[1]);
+      }
+
+      if (url.pathname === "/v1/grants" && req.method === "GET") {
+        let rows = [...grants.values()].map(grantView).sort((a, b) => a.id.localeCompare(b.id));
+        for (const field of ["app_id", "device_id", "workspace_id"] as const) {
+          const value = url.searchParams.get(field);
+          if (value) rows = rows.filter((row) => row[field] === value);
+        }
+        const { page, next_cursor } = paginate(rows, url);
+        return Response.json({ grants: page, next_cursor });
+      }
+
+      const appRevokeMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/revoke$/);
+      if (appRevokeMatch && req.method === "POST") {
+        return handleRevokeApp(appRevokeMatch[1]);
+      }
+
+      const deviceRevokeMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/revoke$/);
+      if (deviceRevokeMatch && req.method === "POST") {
+        return handleRevokeDevice(deviceRevokeMatch[1]);
       }
 
       const appMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)$/);
@@ -557,7 +892,14 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         const active_key = [...appKeys.values()].find(
           (key) => key.app_id === app.id && key.status === "active",
         );
-        return Response.json({ app, active_key });
+        const appGrants = [...grants.values()].filter((grant) => grant.app_id === app.id).map(grantView);
+        return Response.json({
+          app,
+          active_key,
+          grants: appGrants,
+          recent_messages: [...messages.values()].filter((item) => item.envelope.app_id === app.id).map(messageView).slice(-20).reverse(),
+          recent_audit_events: auditEvents.filter((event) => event.app_id === app.id).slice(-50).reverse(),
+        });
       }
 
       const deviceMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)$/);
@@ -567,11 +909,27 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         const active_key = [...deviceKeys.values()].find(
           (key) => key.device_id === device.id && key.status === "active",
         );
-        return Response.json({ device, active_key });
+        return Response.json({
+          device,
+          active_key,
+          capabilities: latestCapabilitiesFor(device.id),
+          grants: [...grants.values()].filter((grant) => grant.device_id === device.id).map(grantView),
+          recent_messages: [...messages.values()].filter((item) => item.envelope.device_id === device.id).map(messageView).slice(-20).reverse(),
+          recent_audit_events: auditEvents.filter((event) => event.device_id === device.id).slice(-50).reverse(),
+          local_policy: {
+            status: "not_reported",
+            default_behavior: "deny by default",
+            copy: "Cloud grants allow an app to ask. Local policy on this machine still decides whether the request can run.",
+          },
+        });
       }
 
       if (url.pathname === "/v1/messages" && req.method === "POST") {
         return handleCreateMessage(req);
+      }
+
+      if (url.pathname === "/v1/messages" && req.method === "GET") {
+        return listMessages(url);
       }
 
       const cancelMatch = url.pathname.match(/^\/v1\/messages\/([^/]+)\/cancel$/);
@@ -588,15 +946,15 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
           status: item.status,
           history: item.history,
           result: item.result,
+          message: messageView(item),
+          status_events: messageStatusEvents.filter((event) => event.message_id === item.envelope.message_id),
+          audit_events: auditEvents.filter((event) => event.message_id === item.envelope.message_id),
+          crypto: messageView(item).crypto,
         });
       }
 
       if (url.pathname === "/v1/audit-events" && req.method === "GET") {
-        const messageId = url.searchParams.get("message_id");
-        const events = messageId
-          ? auditEvents.filter((event) => event.message_id === messageId)
-          : auditEvents;
-        return Response.json({ audit_events: events });
+        return listAuditEvents(url);
       }
 
       if (url.pathname === "/v1/device-plugin-capabilities" && req.method === "GET") {
@@ -646,7 +1004,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         if (deviceSocket === ws) deviceSocket = undefined;
         const device = devices.get(ws.data.deviceId);
         if (device) {
-          device.status = "offline";
+          if (device.status !== "revoked") device.status = "offline";
           device.last_seen_at = new Date().toISOString();
           audit("device", device.id, "device.disconnected", {
             workspace_id: device.workspace_id,

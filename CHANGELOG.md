@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added the M2 control plane plan, product contract, local control-plane UI, backend APIs, revoke semantics, and verifier.
 - Added the Musubi M1.5 Codex plugin plan.
 - Added the Codex plugin skeleton, CLI routing/capability reporting, and local M1.5 verifier.
 - Added the M1.6 runtime hardening plan, Codex runtime timeout/output/error handling, and local/deployed negative-path verifiers.

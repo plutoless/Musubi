@@ -66,6 +66,8 @@ tools/
 - [M1 architecture](docs/architecture_m1.md)
 - [M1.5 Codex plugin plan](docs/musubi_m_1_5_codex_plugin_plan.md)
 - [M1.6 runtime hardening plan](docs/musubi_m_1_6_runtime_hardening_plan.md)
+- [M2 control plane](docs/control_plane_m2.md)
+- [M2 control plane plan](docs/musubi_m_2_control_plane_plan.md)
 - [Hosted M1 deployment](docs/hosted_m1_deployment.md)
 - [Repository policy](docs/policy.md)
 
@@ -259,6 +261,20 @@ After configuring hosted secrets, run the deployed negative-path Neon proof:
 MUSUBI_HOSTED_URL="https://<worker-host>" \
 NEON_DATABASE_URL="<postgres-url>" \
 bun run verify:slice13:deployed
+```
+
+### M2 Control Plane Verification
+
+Run the local control-plane verifier:
+
+```bash
+bun run verify:m2-control-plane
+```
+
+The local relay serves the control plane at:
+
+```text
+http://127.0.0.1:8787/control-plane
 ```
 
 ### Message States

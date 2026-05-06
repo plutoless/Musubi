@@ -31,6 +31,7 @@
     "verify:slice12:deployed": "bun run tools/verify_slice12_codex_deployed.ts",
     "verify:slice13": "bun run tools/verify_slice13_runtime_hardening.ts",
     "verify:slice13:deployed": "bun run tools/verify_slice13_runtime_hardening_deployed.ts",
+    "verify:m2-control-plane": "bun run tools/verify_m2_control_plane.ts",
     "verify:m1-readiness": "bun run tools/verify_m1_readiness.ts"
   },
   "devDependencies": {},
