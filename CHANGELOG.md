@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Added the Musubi M1.5 Codex plugin plan.
+- Added the Codex plugin skeleton, CLI routing/capability reporting, and local M1.5 verifier.
 
 ## M1 Baseline - 2026-05-07
 

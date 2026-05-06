@@ -599,7 +599,7 @@ func runStartCLI(args []string) error {
 
 func reportPluginCapabilities(config deviceConfig) error {
 	plugins := []map[string]interface{}{}
-	for _, name := range []string{"echo", "hermes"} {
+	for _, name := range []string{"echo", "hermes", "codex"} {
 		manifest, err := loadPluginManifest(name)
 		if err != nil {
 			return err
@@ -696,6 +696,9 @@ func (cache *replayCache) Seen(key string, now time.Time) bool {
 func pluginNameForChannel(channel string) string {
 	if strings.HasPrefix(channel, "hermes.") {
 		return "hermes"
+	}
+	if strings.HasPrefix(channel, "codex.") {
+		return "codex"
 	}
 	return "echo"
 }
@@ -820,6 +823,9 @@ func registeredResultEnvelope(config deviceConfig, envelope MessageEnvelope, sta
 func resultChannelFor(requestChannel string) string {
 	if strings.HasPrefix(requestChannel, "hermes.") {
 		return "hermes.task.event"
+	}
+	if strings.HasPrefix(requestChannel, "codex.") {
+		return "codex.task.event"
 	}
 	return "echo.event"
 }

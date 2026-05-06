@@ -55,6 +55,8 @@ jobs:
           bun run verify:slice9
           bun run verify:slice10
           bun run verify:slice11
+          bun run verify:slice12
+          bun run verify:slice12:runtime
 
       - name: Verify hosted Worker build
         run: bun run verify:slice11:build
@@ -114,4 +116,6 @@ jobs:
 
       - name: Verify deployed Cloudflare and Neon flow
         if: steps.secrets.outputs.configured == 'true'
-        run: bun run verify:slice11:deployed
+        run: |
+          bun run verify:slice11:deployed
+          bun run verify:slice12:deployed

@@ -185,6 +185,8 @@ bun run verify:slice10:hermes
 bun run verify:slice11
 bun run verify:slice11:build
 bun run verify:slice11:local
+bun run verify:slice12
+bun run verify:slice12:runtime
 bun run verify:m1-readiness
 ```
 
@@ -214,6 +216,30 @@ bun run verify:slice11:deployed
 A real hosted deployment still requires Cloudflare authentication and Neon configuration.
 
 Hermes runtime integration is implemented as a plugin-local process adapter. Configure `HERMES_COMMAND` to point at the real Hermes local runtime; see [plugins/hermes/README.md](plugins/hermes/README.md).
+
+### M1.5 Codex Verification
+
+Run the local encrypted Codex plugin flow:
+
+```bash
+bun run verify:slice12
+```
+
+Run the deterministic Codex runtime adapter check:
+
+```bash
+bun run verify:slice12:runtime
+```
+
+After configuring hosted secrets, run the deployed Cloudflare/Neon Codex proof:
+
+```bash
+MUSUBI_HOSTED_URL="https://<worker-host>" \
+NEON_DATABASE_URL="<postgres-url>" \
+bun run verify:slice12:deployed
+```
+
+Codex runtime integration is implemented as a plugin-local process adapter. Configure `CODEX_COMMAND` to point at a local Codex-compatible runtime; see [plugins/codex/README.md](plugins/codex/README.md).
 
 ### Message States
 

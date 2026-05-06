@@ -1,0 +1,29 @@
+{
+  "name": "codex",
+  "version": "0.1.0",
+  "description": "Run Codex coding-agent tasks on the local machine",
+  "runtime": "bun",
+  "entry": "bun run plugins/codex/src/main.ts",
+  "channels": [
+    "codex.task.create",
+    "codex.task.cancel",
+    "codex.task.status",
+    "codex.task.event"
+  ],
+  "permissions": [
+    "process.spawn",
+    "fs.read.project",
+    "fs.write.project",
+    "network.outbound"
+  ],
+  "config_schema": {
+    "workspace_dir": {
+      "type": "string",
+      "required": false
+    },
+    "codex_command": {
+      "type": "string",
+      "required": false
+    }
+  }
+}

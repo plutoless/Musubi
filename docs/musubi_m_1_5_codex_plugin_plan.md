@@ -231,6 +231,10 @@ Acceptance:
 - CLI can run the Codex plugin over JSON-RPC stdio without server changes.
 - Plugin returns deterministic simulated output when no runtime command is configured.
 
+Status:
+
+- Implemented.
+
 ## Slice 2: CLI Capability Reporting and Dispatch
 
 Deliverables:
@@ -245,6 +249,10 @@ Acceptance:
 - Encrypted `codex.task.create` reaches the Codex plugin.
 - App decrypts progress and final result events.
 
+Status:
+
+- Implemented locally.
+
 ## Slice 3: Codex Runtime Adapter
 
 Deliverables:
@@ -258,6 +266,10 @@ Acceptance:
 - A verifier can run a deterministic command such as `/bin/echo codex-runtime-ok`.
 - A verifier can run the real local Codex CLI when present.
 - Errors do not leak sensitive local paths or prompts into server-visible audit metadata.
+
+Status:
+
+- Deterministic runtime command verifier implemented.
 
 ## Slice 4: Local Policy Coverage
 
@@ -284,6 +296,10 @@ Acceptance:
 - Deployed Worker routes encrypted Codex flow through Durable Object WebSocket.
 - Neon has completed message status and plaintext-free audit rows.
 - Device reconnect still works.
+
+Status:
+
+- Implemented for encrypted Codex flow, Neon status/audit rows, grant rows, and capability rows.
 
 ## 8. Verifier Plan
 
