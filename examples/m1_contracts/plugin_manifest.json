@@ -1,0 +1,24 @@
+{
+  "name": "hermes",
+  "version": "0.1.0",
+  "description": "Run Hermes tasks on the local machine",
+  "runtime": "nodejs",
+  "entry": "node ./dist/index.js",
+  "channels": [
+    "hermes.task.create",
+    "hermes.task.cancel",
+    "hermes.task.status"
+  ],
+  "permissions": [
+    "process.spawn",
+    "fs.read.project",
+    "fs.write.project",
+    "network.outbound"
+  ],
+  "config_schema": {
+    "workspace_dir": {
+      "type": "string",
+      "required": false
+    }
+  }
+}

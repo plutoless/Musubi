@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Musubi M1 Plugin Manifest",
+  "type": "object",
+  "required": ["name", "version", "description", "runtime", "entry", "channels", "permissions"],
+  "properties": {
+    "name": { "type": "string" },
+    "version": { "type": "string" },
+    "description": { "type": "string" },
+    "runtime": { "type": "string" },
+    "entry": { "type": "string" },
+    "channels": { "type": "array", "items": { "type": "string" } },
+    "permissions": { "type": "array", "items": { "type": "string" } },
+    "config_schema": { "type": "object" }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "echo",
+  "version": "0.1.0",
+  "description": "Echo plugin for validating Musubi plugin dispatch",
+  "runtime": "bun",
+  "entry": "bun run plugins/echo/src/main.ts",
+  "channels": ["echo.echo", "echo.ping"],
+  "permissions": ["status.report"]
+}

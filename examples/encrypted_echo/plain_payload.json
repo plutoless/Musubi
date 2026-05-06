@@ -1,0 +1,6 @@
+{
+  "type": "echo.echo",
+  "body": {
+    "text": "hello from local plugin"
+  }
+}

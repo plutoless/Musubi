@@ -1,0 +1,35 @@
+{
+  "name": "musubi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "server": "bun run apps/relay-server/src/main.ts",
+    "app:echo": "bun run apps/app-simulator/src/main.ts echo.echo",
+    "app:denied": "bun run apps/app-simulator/src/main.ts shell.run",
+    "db:migrate:neon": "bun run tools/apply_neon_migrations.ts",
+    "verify": "bun run tools/verify.ts",
+    "verify:go": "MUSUBI_VERIFY_DEVICE=go bun run tools/verify.ts",
+    "verify:m1-contracts": "bun run tools/verify_m1_contracts.ts",
+    "verify:slice1": "bun run tools/verify_slice1.ts",
+    "verify:slice2": "bun run tools/verify_slice2.ts",
+    "verify:slice3": "bun run tools/verify_slice3.ts",
+    "verify:slice4": "bun run tools/verify_slice4.ts",
+    "verify:slice5": "bun run tools/verify_slice5.ts",
+    "verify:slice6": "bun run tools/verify_slice6.ts",
+    "verify:slice7": "bun run tools/verify_slice7.ts",
+    "verify:slice8": "bun run tools/verify_slice8.ts",
+    "verify:slice9": "bun run tools/verify_slice9.ts",
+    "verify:slice10": "bun run tools/verify_slice10.ts",
+    "verify:slice10:hermes": "MUSUBI_HERMES_COMMAND=\"/Users/zhangqianze/.local/bin/hermes -z\" MUSUBI_HERMES_PROMPT=\"Reply with exactly: hermes-runtime-ok\" MUSUBI_HERMES_EXPECT=\"hermes-runtime-ok\" bun run tools/verify_slice10.ts",
+    "verify:slice11": "bun run tools/verify_slice11.ts",
+    "verify:slice11:build": "cd server/workers && TMPDIR=\"../../.cache/tmp\" BUN_INSTALL_CACHE_DIR=\"../../.cache/bun\" bunx wrangler deploy --dry-run --outdir ../../.cache/worker-build",
+    "verify:slice11:local": "bun run tools/verify_slice11_hosted_local.ts",
+    "verify:slice11:deployed": "bun run tools/verify_slice11_deployed.ts",
+    "verify:m1-readiness": "bun run tools/verify_m1_readiness.ts"
+  },
+  "devDependencies": {},
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0"
+  }
+}

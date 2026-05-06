@@ -1,0 +1,17 @@
+name = "musubi-m1"
+main = "src/index.ts"
+compatibility_date = "2026-05-06"
+
+[[durable_objects.bindings]]
+name = "DEVICE_SESSION"
+class_name = "DeviceSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DeviceSession"]
+
+[vars]
+MUSUBI_ENV = "m1"
+
+# Configure in Cloudflare dashboard or wrangler secret:
+# NEON_DATABASE_URL

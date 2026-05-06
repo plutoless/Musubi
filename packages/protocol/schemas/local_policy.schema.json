@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Musubi M1 Local Policy",
+  "type": "object",
+  "required": ["version", "defaults", "apps", "plugins"],
+  "properties": {
+    "version": { "type": "string", "enum": ["m1"] },
+    "defaults": {
+      "type": "object",
+      "required": ["require_local_confirm", "max_task_duration_seconds"],
+      "properties": {
+        "require_local_confirm": { "type": "boolean" },
+        "max_task_duration_seconds": { "type": "integer" }
+      }
+    },
+    "apps": { "type": "object" },
+    "plugins": { "type": "object" }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "hermes",
+  "version": "0.1.0",
+  "description": "Skeleton Hermes plugin for Musubi M1 task flow",
+  "runtime": "bun",
+  "entry": "bun run plugins/hermes/src/main.ts",
+  "channels": [
+    "hermes.task.create",
+    "hermes.task.cancel",
+    "hermes.task.status",
+    "hermes.task.event"
+  ],
+  "permissions": [
+    "process.spawn",
+    "fs.read.project",
+    "fs.write.project",
+    "network.outbound"
+  ],
+  "config_schema": {
+    "workspace_dir": {
+      "type": "string",
+      "required": false
+    },
+    "hermes_endpoint": {
+      "type": "string",
+      "required": false
+    }
+  }
+}

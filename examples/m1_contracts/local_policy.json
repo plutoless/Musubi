@@ -1,0 +1,42 @@
+{
+  "version": "m1",
+  "defaults": {
+    "require_local_confirm": true,
+    "max_task_duration_seconds": 3600
+  },
+  "apps": {
+    "app_hermes": {
+      "name": "Hermes Web",
+      "plugins": {
+        "hermes": {
+          "allow": [
+            "hermes.task.create",
+            "hermes.task.cancel",
+            "hermes.task.status"
+          ],
+          "require_local_confirm": false,
+          "max_task_duration_seconds": 14400,
+          "allowed_workspace_dirs": [
+            "~/projects",
+            "~/workspace"
+          ]
+        }
+      }
+    }
+  },
+  "plugins": {
+    "hermes": {
+      "enabled": true,
+      "permissions": [
+        "process.spawn",
+        "fs.read.project",
+        "fs.write.project",
+        "network.outbound"
+      ]
+    },
+    "echo": {
+      "enabled": true,
+      "permissions": []
+    }
+  }
+}

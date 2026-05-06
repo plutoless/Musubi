@@ -1,0 +1,19 @@
+{
+  "message_id": "msg_123",
+  "workspace_id": "ws_123",
+  "app_id": "app_hermes",
+  "device_id": "dev_macbook",
+  "channel": "hermes.task.create",
+  "created_at": "2026-05-06T10:00:00Z",
+  "expires_at": "2026-05-06T10:05:00Z",
+  "visible_metadata": {
+    "trace_id": "trace_123"
+  },
+  "crypto": {
+    "version": "m1",
+    "alg": "x25519-xsalsa20-poly1305",
+    "sender_key_id": "appkey_123",
+    "recipient_key_id": "devkey_456"
+  },
+  "ciphertext": "base64..."
+}
