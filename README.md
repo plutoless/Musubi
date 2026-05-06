@@ -65,6 +65,7 @@ tools/
 - [Musubi PRD v1](docs/musubi_prd_v_1.md)
 - [M1 architecture](docs/architecture_m1.md)
 - [M1.5 Codex plugin plan](docs/musubi_m_1_5_codex_plugin_plan.md)
+- [M1.6 runtime hardening plan](docs/musubi_m_1_6_runtime_hardening_plan.md)
 - [Hosted M1 deployment](docs/hosted_m1_deployment.md)
 - [Repository policy](docs/policy.md)
 
@@ -187,6 +188,7 @@ bun run verify:slice11:build
 bun run verify:slice11:local
 bun run verify:slice12
 bun run verify:slice12:runtime
+bun run verify:slice13
 bun run verify:m1-readiness
 ```
 
@@ -240,6 +242,24 @@ bun run verify:slice12:deployed
 ```
 
 Codex runtime integration is implemented as a plugin-local process adapter. Configure `CODEX_COMMAND` to point at a local Codex-compatible runtime; see [plugins/codex/README.md](plugins/codex/README.md).
+
+### M1.6 Runtime Hardening Verification
+
+Run the local negative-path hardening suite:
+
+```bash
+bun run verify:slice13
+```
+
+The suite covers denied server grants, local policy denial, unsupported Codex channels, runtime exit failures, runtime timeouts, output caps, and plaintext-free audit/status records.
+
+After configuring hosted secrets, run the deployed negative-path Neon proof:
+
+```bash
+MUSUBI_HOSTED_URL="https://<worker-host>" \
+NEON_DATABASE_URL="<postgres-url>" \
+bun run verify:slice13:deployed
+```
 
 ### Message States
 

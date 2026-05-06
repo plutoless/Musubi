@@ -57,6 +57,7 @@ jobs:
           bun run verify:slice11
           bun run verify:slice12
           bun run verify:slice12:runtime
+          bun run verify:slice13
 
       - name: Verify hosted Worker build
         run: bun run verify:slice11:build
@@ -119,3 +120,4 @@ jobs:
         run: |
           bun run verify:slice11:deployed
           bun run verify:slice12:deployed
+          bun run verify:slice13:deployed

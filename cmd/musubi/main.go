@@ -114,6 +114,9 @@ type PluginResultBody struct {
 	Echo      string `json:"echo,omitempty"`
 	Pong      bool   `json:"pong,omitempty"`
 	HandledBy string `json:"handled_by"`
+	ErrorCode string `json:"error_code,omitempty"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
+	TimedOut  bool   `json:"timed_out,omitempty"`
 }
 
 type messageHandleResult struct {
@@ -662,11 +665,11 @@ func handleRegisteredEnvelope(config deviceConfig, envelope MessageEnvelope, plu
 		return []ResultEnvelope{registeredFailure(config, envelope, "REPLAY_REJECTED: duplicate payload nonce")}
 	}
 	progress := registeredProgressEnvelope(config, envelope, pluginName)
-	result, err := callPlugin(fmt.Sprintf("bun run plugins/%s/src/main.ts", pluginName), envelope.Channel, payload)
+	result, status, err := callPlugin(fmt.Sprintf("bun run plugins/%s/src/main.ts", pluginName), envelope.Channel, payload)
 	if err != nil {
 		return []ResultEnvelope{registeredFailure(config, envelope, err.Error())}
 	}
-	return []ResultEnvelope{progress, registeredResultEnvelope(config, envelope, "completed", result)}
+	return []ResultEnvelope{progress, registeredResultEnvelope(config, envelope, status, result)}
 }
 
 func newReplayCache(ttl time.Duration) *replayCache {
@@ -1121,31 +1124,31 @@ func handleEnvelope(envelope MessageEnvelope, pluginCommand string) ResultEnvelo
 		return failure(envelope, err.Error())
 	}
 
-	result, err := callPlugin(pluginCommand, envelope.Channel, payload)
+	result, status, err := callPlugin(pluginCommand, envelope.Channel, payload)
 	if err != nil {
 		return failure(envelope, err.Error())
 	}
 
-	return resultEnvelope(envelope, "completed", result)
+	return resultEnvelope(envelope, status, result)
 }
 
-func callPlugin(pluginCommand string, channel string, payload AppPayload) (PluginResultPayload, error) {
+func callPlugin(pluginCommand string, channel string, payload AppPayload) (PluginResultPayload, string, error) {
 	parts := strings.Fields(pluginCommand)
 	if len(parts) == 0 {
-		return PluginResultPayload{}, errors.New("empty plugin command")
+		return PluginResultPayload{}, "", errors.New("empty plugin command")
 	}
 	cmd := exec.Command(parts[0], parts[1:]...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return PluginResultPayload{}, err
+		return PluginResultPayload{}, "", err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return PluginResultPayload{}, err
+		return PluginResultPayload{}, "", err
 	}
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		return PluginResultPayload{}, err
+		return PluginResultPayload{}, "", err
 	}
 
 	request := jsonRPCRequest{
@@ -1155,27 +1158,34 @@ func callPlugin(pluginCommand string, channel string, payload AppPayload) (Plugi
 		Params:  map[string]interface{}{"channel": channel, "payload": payload},
 	}
 	if err := json.NewEncoder(stdin).Encode(request); err != nil {
-		return PluginResultPayload{}, err
+		return PluginResultPayload{}, "", err
 	}
 	_ = stdin.Close()
 
 	line, err := bufio.NewReader(stdout).ReadBytes('\n')
 	if err != nil {
-		return PluginResultPayload{}, err
+		return PluginResultPayload{}, "", err
 	}
 	_ = cmd.Process.Kill()
 	var response genericJSONRPCResponse
 	if err := json.Unmarshal(bytes.TrimSpace(line), &response); err != nil {
-		return PluginResultPayload{}, err
+		return PluginResultPayload{}, "", err
 	}
 	if response.Error != nil {
-		return PluginResultPayload{}, errors.New(response.Error.Message)
+		return PluginResultPayload{}, "", errors.New(response.Error.Message)
 	}
 	var handled messageHandleResult
 	if err := json.Unmarshal(response.Result, &handled); err != nil {
-		return PluginResultPayload{}, err
+		return PluginResultPayload{}, "", err
 	}
-	return PluginResultPayload{Type: "task.result", Body: handled.Body}, nil
+	status := handled.Status
+	if status == "" {
+		status = "completed"
+	}
+	if status != "completed" && status != "failed" {
+		return PluginResultPayload{}, "", fmt.Errorf("plugin returned unsupported status %s", status)
+	}
+	return PluginResultPayload{Type: "task.result", Body: handled.Body}, status, nil
 }
 
 func failure(envelope MessageEnvelope, message string) ResultEnvelope {
