@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added the M3 TypeScript App SDK, user-owned app CLI creation, app-scoped API keys, SDK docs, and verifier.
+- Added the M2.5 real Codex adapter contract, workspace-policy validation, streaming event support, and verifier.
 - Added the M2 control plane plan, product contract, local control-plane UI, backend APIs, revoke semantics, and verifier.
 - Added the Musubi M1.5 Codex plugin plan.
 - Added the Codex plugin skeleton, CLI routing/capability reporting, and local M1.5 verifier.

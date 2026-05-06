@@ -59,6 +59,8 @@ jobs:
           bun run verify:slice12:runtime
           bun run verify:slice13
           bun run verify:m2-control-plane
+          bun run verify:m2.5-codex
+          bun run verify:m3-app-sdk
 
       - name: Verify hosted Worker build
         run: bun run verify:slice11:build

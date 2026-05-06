@@ -414,6 +414,10 @@ h3 {
   margin: 0 14px 12px;
 }
 
+.table-panel .panel-tools {
+  margin: 0 14px 12px;
+}
+
 .table-panel > .empty-state {
   padding: 0 14px 14px;
 }
@@ -422,6 +426,19 @@ h3 {
   border-radius: var(--radius-inner);
   box-shadow: var(--shadow-soft);
   padding: 12px;
+}
+
+.revealed-secret {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+  background: var(--warn-soft);
+  box-shadow: inset 0 0 0 1px rgba(181, 71, 8, 0.18), 0 5px 14px rgba(20, 28, 36, 0.03);
+}
+
+.sdk-panel {
+  display: grid;
+  gap: 10px;
 }
 
 .panel > .band + .band {

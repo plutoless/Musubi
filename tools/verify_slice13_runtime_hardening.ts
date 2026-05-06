@@ -56,14 +56,14 @@ async function assertDirectPluginHardening() {
   const exit = await callCodexPlugin("codex.task.create", "direct exit", {
     CODEX_COMMAND_JSON: JSON.stringify(["/bin/sh", "-c", "exit 7"]),
   });
-  assertPluginFailure(exit, "CODEX_RUNTIME_EXIT");
+  assertPluginFailure(exit, "CODEX_PROCESS_FAILED");
   if (exit.body.exit_code !== 7) throw new Error(`expected runtime exit code 7, got ${exit.body.exit_code}`);
 
   const timeout = await callCodexPlugin("codex.task.create", "direct timeout", {
     CODEX_COMMAND_JSON: JSON.stringify(["/bin/sh", "-c", "sleep 1"]),
     CODEX_TIMEOUT_MS: "50",
   });
-  assertPluginFailure(timeout, "CODEX_RUNTIME_TIMEOUT");
+  assertPluginFailure(timeout, "CODEX_TIMEOUT");
   if (timeout.body.timed_out !== true) throw new Error("expected timed_out=true for runtime timeout");
 
   const capped = await callCodexPlugin("codex.task.create", "direct output cap", {

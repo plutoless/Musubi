@@ -1,7 +1,7 @@
 {
   "name": "codex",
-  "version": "0.1.0",
-  "description": "Run Codex coding-agent tasks on the local machine",
+  "version": "0.2.5",
+  "description": "Run approved local Codex tasks through encrypted Musubi messages",
   "runtime": "bun",
   "entry": "bun run plugins/codex/src/main.ts",
   "channels": [
@@ -17,13 +17,36 @@
     "network.outbound"
   ],
   "config_schema": {
-    "workspace_dir": {
+    "codex_binary": {
+      "type": "string",
+      "required": false,
+      "default": "codex"
+    },
+    "allowed_workspace_dirs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "required": true
+    },
+    "default_working_dir": {
       "type": "string",
       "required": false
     },
-    "codex_command": {
+    "approval_mode": {
       "type": "string",
-      "required": false
+      "required": false,
+      "enum": ["manual", "auto", "codex_default"],
+      "default": "codex_default"
+    },
+    "sandbox_mode": {
+      "type": "string",
+      "required": false,
+      "enum": ["read_only", "workspace_write", "codex_default"],
+      "default": "codex_default"
+    },
+    "max_task_duration_seconds": {
+      "type": "number",
+      "required": false,
+      "default": 3600
     }
   }
 }

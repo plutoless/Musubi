@@ -100,7 +100,13 @@ type AppPayload struct {
 	Type  string `json:"type"`
 	Nonce string `json:"nonce,omitempty"`
 	Body  struct {
-		Text string `json:"text,omitempty"`
+		Text          string                 `json:"text,omitempty"`
+		Instruction   string                 `json:"instruction,omitempty"`
+		WorkspaceHint string                 `json:"workspace_hint,omitempty"`
+		Mode          string                 `json:"mode,omitempty"`
+		Stream        bool                   `json:"stream,omitempty"`
+		Limits        map[string]interface{} `json:"limits,omitempty"`
+		PluginOptions map[string]interface{} `json:"codex_options,omitempty"`
 	} `json:"body"`
 }
 
@@ -110,13 +116,19 @@ type PluginResultPayload struct {
 }
 
 type PluginResultBody struct {
-	OK        bool   `json:"ok"`
-	Echo      string `json:"echo,omitempty"`
-	Pong      bool   `json:"pong,omitempty"`
-	HandledBy string `json:"handled_by"`
-	ErrorCode string `json:"error_code,omitempty"`
-	ExitCode  *int   `json:"exit_code,omitempty"`
-	TimedOut  bool   `json:"timed_out,omitempty"`
+	OK        bool                   `json:"ok"`
+	Echo      string                 `json:"echo,omitempty"`
+	Pong      bool                   `json:"pong,omitempty"`
+	HandledBy string                 `json:"handled_by"`
+	TaskID    string                 `json:"task_id,omitempty"`
+	EventType string                 `json:"event_type,omitempty"`
+	Status    string                 `json:"status,omitempty"`
+	Message   string                 `json:"message,omitempty"`
+	Timestamp string                 `json:"timestamp,omitempty"`
+	ErrorCode string                 `json:"error_code,omitempty"`
+	ExitCode  *int                   `json:"exit_code,omitempty"`
+	TimedOut  bool                   `json:"timed_out,omitempty"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
 type messageHandleResult struct {
@@ -157,6 +169,18 @@ type genericJSONRPCResponse struct {
 	} `json:"error,omitempty"`
 }
 
+type genericJSONRPCNotification struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+}
+
+type pluginCallResult struct {
+	Final  PluginResultPayload
+	Status string
+	Events []PluginResultPayload
+}
+
 type pluginManifest struct {
 	Name        string   `json:"name"`
 	Version     string   `json:"version"`
@@ -179,13 +203,18 @@ type localPolicyApp struct {
 }
 
 type localPolicyAppPlugin struct {
-	Allow               []string `json:"allow" yaml:"allow"`
-	RequireLocalConfirm bool     `json:"require_local_confirm" yaml:"require_local_confirm"`
+	Allow                  []string `json:"allow" yaml:"allow"`
+	RequireLocalConfirm    bool     `json:"require_local_confirm" yaml:"require_local_confirm"`
+	MaxTaskDurationSeconds int      `json:"max_task_duration_seconds" yaml:"max_task_duration_seconds"`
+	AllowedWorkspaceDirs   []string `json:"allowed_workspace_dirs" yaml:"allowed_workspace_dirs"`
+	ApprovalMode           string   `json:"approval_mode" yaml:"approval_mode"`
+	SandboxMode            string   `json:"sandbox_mode" yaml:"sandbox_mode"`
 }
 
 type localPolicyPlugin struct {
-	Enabled     bool     `json:"enabled" yaml:"enabled"`
-	Permissions []string `json:"permissions" yaml:"permissions"`
+	Enabled     bool                   `json:"enabled" yaml:"enabled"`
+	Permissions []string               `json:"permissions" yaml:"permissions"`
+	Config      map[string]interface{} `json:"config" yaml:"config"`
 }
 
 type replayCache struct {
@@ -209,6 +238,12 @@ type deviceConfig struct {
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "plugin" {
 		if err := runPluginCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "app" {
+		if err := runAppCLI(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -354,6 +389,138 @@ func runDevCLI(args []string) error {
 	return nil
 }
 
+func runAppCLI(args []string) error {
+	if len(args) < 2 || args[0] != "create" {
+		return errors.New("usage: musubi app create <name> --server <url> [--home <path>] [--workspace <id>] [--type user_owned] [--generate-key-local] [--env]")
+	}
+	name := args[1]
+	flags := flag.NewFlagSet("app create", flag.ContinueOnError)
+	serverURL := flags.String("server", "http://127.0.0.1:8787", "Musubi server URL")
+	home := flags.String("home", defaultMusubiHome(), "Musubi home directory")
+	workspaceID := flags.String("workspace", "ws_local", "workspace ID")
+	appType := flags.String("type", "user_owned", "app type")
+	generateKeyLocal := flags.Bool("generate-key-local", true, "generate app private key locally")
+	printEnv := flags.Bool("env", false, "print SDK environment variables")
+	apiKeyName := flags.String("api-key-name", "Local SDK key", "API key name")
+	if err := flags.Parse(args[2:]); err != nil {
+		return err
+	}
+	if *appType != "user_owned" && *appType != "first_party" {
+		return errors.New("app type must be user_owned or first_party")
+	}
+	if !*generateKeyLocal {
+		return errors.New("M3 local app creation requires --generate-key-local")
+	}
+
+	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	publicKey := privateKey.PublicKey()
+	createResponse, err := createRelayApp(*serverURL, *workspaceID, name, *appType, base64.StdEncoding.EncodeToString(publicKey.Bytes()))
+	if err != nil {
+		return err
+	}
+	apiKeyResponse, err := createRelayAppAPIKey(*serverURL, createResponse.AppID, *apiKeyName)
+	if err != nil {
+		return err
+	}
+
+	appDir := filepath.Join(*home, "apps")
+	if err := os.MkdirAll(appDir, 0700); err != nil {
+		return err
+	}
+	appConfig := map[string]string{
+		"workspace_id":     *workspaceID,
+		"app_id":           createResponse.AppID,
+		"app_key_id":       createResponse.AppKeyID,
+		"app_api_key_id":   apiKeyResponse.Key.ID,
+		"app_name":         name,
+		"server_url":       *serverURL,
+		"app_private_key":  base64.StdEncoding.EncodeToString(privateKey.Bytes()),
+		"app_public_key":   base64.StdEncoding.EncodeToString(publicKey.Bytes()),
+		"app_api_key":      apiKeyResponse.APIKey,
+		"server_key_scope": "app-sdk-local",
+	}
+	bytes, err := json.MarshalIndent(appConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(appDir, createResponse.AppID+".json")
+	if err := os.WriteFile(path, bytes, 0600); err != nil {
+		return err
+	}
+
+	if *printEnv {
+		fmt.Printf("MUSUBI_API_BASE_URL=%s\n", *serverURL)
+		fmt.Printf("MUSUBI_APP_ID=%s\n", createResponse.AppID)
+		fmt.Printf("MUSUBI_APP_KEY_ID=%s\n", createResponse.AppKeyID)
+		fmt.Printf("MUSUBI_API_KEY=%s\n", apiKeyResponse.APIKey)
+		fmt.Printf("MUSUBI_APP_PRIVATE_KEY=%s\n", appConfig["app_private_key"])
+		return nil
+	}
+	fmt.Printf("created app %s with app key %s and api key %s\n", createResponse.AppID, createResponse.AppKeyID, apiKeyResponse.Key.ID)
+	fmt.Printf("app private key written to %s\n", path)
+	return nil
+}
+
+type createRelayAppResponse struct {
+	AppID    string `json:"app_id"`
+	AppKeyID string `json:"app_key_id"`
+	Status   string `json:"status"`
+}
+
+type createRelayAppAPIKeyResponse struct {
+	APIKey string `json:"api_key"`
+	Key    struct {
+		ID     string `json:"id"`
+		Prefix string `json:"prefix"`
+		Status string `json:"status"`
+	} `json:"key"`
+}
+
+func createRelayApp(serverURL string, workspaceID string, name string, appType string, publicKey string) (createRelayAppResponse, error) {
+	request := map[string]interface{}{
+		"workspace_id": workspaceID,
+		"name":         name,
+		"type":         appType,
+		"public_key":   publicKey,
+	}
+	var response createRelayAppResponse
+	if err := postJSON(strings.TrimRight(serverURL, "/")+"/v1/apps", request, &response); err != nil {
+		return createRelayAppResponse{}, err
+	}
+	return response, nil
+}
+
+func createRelayAppAPIKey(serverURL string, appID string, name string) (createRelayAppAPIKeyResponse, error) {
+	var response createRelayAppAPIKeyResponse
+	if err := postJSON(strings.TrimRight(serverURL, "/")+"/v1/apps/"+appID+"/api-keys", map[string]interface{}{"name": name}, &response); err != nil {
+		return createRelayAppAPIKeyResponse{}, err
+	}
+	return response, nil
+}
+
+func postJSON(url string, request interface{}, response interface{}) error {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("post %s failed: %s %s", url, resp.Status, string(responseBody))
+	}
+	if response == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(response)
+}
+
 func runDevEchoSend(args []string) error {
 	flags := flag.NewFlagSet("dev echo send", flag.ContinueOnError)
 	serverURL := flags.String("server", "http://127.0.0.1:8787", "Musubi server URL")
@@ -361,6 +528,13 @@ func runDevEchoSend(args []string) error {
 	appIDFlag := flags.String("app", "app_001", "app ID")
 	channel := flags.String("channel", "echo.echo", "channel")
 	text := flags.String("text", "hello from m1 public key flow", "echo text")
+	workspaceHint := flags.String("workspace-hint", "", "optional plugin workspace hint")
+	mode := flags.String("mode", "", "optional plugin task mode")
+	approvalMode := flags.String("approval-mode", "", "optional Codex approval mode")
+	sandboxMode := flags.String("sandbox-mode", "", "optional Codex sandbox mode")
+	maxDuration := flags.Int("max-duration", 0, "optional max task duration seconds")
+	streamEvents := flags.Bool("stream", true, "request streaming task events")
+	noWait := flags.Bool("no-wait", false, "send message and print message id without waiting for completion")
 	waitTimeout := flags.Duration("wait-timeout", 30*time.Second, "how long to wait for message completion")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -390,6 +564,22 @@ func runDevEchoSend(args []string) error {
 		Nonce: base64.StdEncoding.EncodeToString(nonceBytes),
 	}
 	payload.Body.Text = *text
+	payload.Body.Instruction = *text
+	payload.Body.WorkspaceHint = *workspaceHint
+	payload.Body.Mode = *mode
+	payload.Body.Stream = *streamEvents
+	if *maxDuration > 0 {
+		payload.Body.Limits = map[string]interface{}{"max_duration_seconds": *maxDuration}
+	}
+	if *approvalMode != "" || *sandboxMode != "" {
+		payload.Body.PluginOptions = map[string]interface{}{}
+		if *approvalMode != "" {
+			payload.Body.PluginOptions["approval_mode"] = *approvalMode
+		}
+		if *sandboxMode != "" {
+			payload.Body.PluginOptions["sandbox_mode"] = *sandboxMode
+		}
+	}
 	ciphertext, err := encryptPublicJSON(payload, appPrivate, devicePublic)
 	if err != nil {
 		return err
@@ -424,6 +614,11 @@ func runDevEchoSend(args []string) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		responseBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("send failed: %s %s", resp.Status, string(responseBody))
+	}
+	if *noWait {
+		fmt.Printf("message id %s\n", messageID)
+		fmt.Println("message status delivered")
+		return nil
 	}
 
 	var status struct {
@@ -664,12 +859,20 @@ func handleRegisteredEnvelope(config deviceConfig, envelope MessageEnvelope, plu
 	if payload.Nonce != "" && replay != nil && replay.Seen("nonce:"+payload.Nonce, time.Now()) {
 		return []ResultEnvelope{registeredFailure(config, envelope, "REPLAY_REJECTED: duplicate payload nonce")}
 	}
+	if err := enforcePayloadLocalPolicy(envelope, pluginName, payload); err != nil {
+		return []ResultEnvelope{registeredFailure(config, envelope, err.Error())}
+	}
 	progress := registeredProgressEnvelope(config, envelope, pluginName)
-	result, status, err := callPlugin(fmt.Sprintf("bun run plugins/%s/src/main.ts", pluginName), envelope.Channel, payload)
+	callResult, err := callPlugin(fmt.Sprintf("bun run plugins/%s/src/main.ts", pluginName), envelope.Channel, payload)
 	if err != nil {
 		return []ResultEnvelope{registeredFailure(config, envelope, err.Error())}
 	}
-	return []ResultEnvelope{progress, registeredResultEnvelope(config, envelope, status, result)}
+	results := []ResultEnvelope{progress}
+	for _, event := range callResult.Events {
+		results = append(results, registeredResultEnvelope(config, envelope, "processing", event))
+	}
+	results = append(results, registeredResultEnvelope(config, envelope, callResult.Status, callResult.Final))
+	return results
 }
 
 func newReplayCache(ttl time.Duration) *replayCache {
@@ -740,6 +943,131 @@ func enforceLocalPolicy(config deviceConfig, envelope MessageEnvelope, pluginNam
 		return errors.New("LOCAL_POLICY_DENIED: local confirmation rejected")
 	}
 	return nil
+}
+
+func enforcePayloadLocalPolicy(envelope MessageEnvelope, pluginName string, payload AppPayload) error {
+	home := activeMusubiHome
+	if home == "" {
+		home = defaultMusubiHome()
+	}
+	policy, err := readLocalPolicy(home)
+	if err != nil {
+		return errors.New("LOCAL_POLICY_DENIED: policy missing or invalid")
+	}
+	appPlugin := policy.Apps[envelope.AppID].Plugins[pluginName]
+	pluginPolicy := policy.Plugins[pluginName]
+	if limit, ok := numericPayloadLimit(payload.Body.Limits, "max_duration_seconds"); ok && appPlugin.MaxTaskDurationSeconds > 0 && limit > appPlugin.MaxTaskDurationSeconds {
+		return errors.New("LOCAL_POLICY_DENIED: task duration exceeds local policy")
+	}
+	if requested := stringPayloadOption(payload.Body.PluginOptions, "approval_mode"); requested != "" && appPlugin.ApprovalMode != "" && appPlugin.ApprovalMode != "codex_default" && requested != appPlugin.ApprovalMode && requested != "codex_default" {
+		return errors.New("LOCAL_POLICY_DENIED: approval mode exceeds local policy")
+	}
+	if requested := stringPayloadOption(payload.Body.PluginOptions, "sandbox_mode"); requested != "" && appPlugin.SandboxMode != "" && appPlugin.SandboxMode != "codex_default" && requested != appPlugin.SandboxMode && requested != "codex_default" {
+		return errors.New("LOCAL_POLICY_DENIED: sandbox mode exceeds local policy")
+	}
+	allowedDirs := append([]string{}, appPlugin.AllowedWorkspaceDirs...)
+	if len(allowedDirs) == 0 {
+		if configured, ok := stringSliceConfig(pluginPolicy.Config["allowed_workspace_dirs"]); ok {
+			allowedDirs = configured
+		}
+	}
+	if len(allowedDirs) == 0 {
+		return nil
+	}
+	workspace := payload.Body.WorkspaceHint
+	if workspace == "" {
+		if configured, ok := pluginPolicy.Config["default_working_dir"].(string); ok {
+			workspace = configured
+		}
+	}
+	if workspace == "" {
+		return errors.New("LOCAL_POLICY_DENIED: workspace required")
+	}
+	ok, err := pathWithinAllowedDirs(workspace, allowedDirs)
+	if err != nil || !ok {
+		return errors.New("WORKSPACE_NOT_ALLOWED: requested workspace is not allowed by local policy")
+	}
+	return nil
+}
+
+func numericPayloadLimit(values map[string]interface{}, key string) (int, bool) {
+	if values == nil {
+		return 0, false
+	}
+	switch value := values[key].(type) {
+	case int:
+		return value, true
+	case float64:
+		return int(value), true
+	case string:
+		var parsed int
+		if _, err := fmt.Sscanf(value, "%d", &parsed); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func stringPayloadOption(values map[string]interface{}, key string) string {
+	if values == nil {
+		return ""
+	}
+	value, _ := values[key].(string)
+	return value
+}
+
+func stringSliceConfig(value interface{}) ([]string, bool) {
+	switch typed := value.(type) {
+	case []string:
+		return typed, true
+	case []interface{}:
+		out := []string{}
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, text)
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+func pathWithinAllowedDirs(path string, allowedDirs []string) (bool, error) {
+	resolvedPath, err := resolveLocalPath(path)
+	if err != nil {
+		return false, err
+	}
+	for _, allowed := range allowedDirs {
+		resolvedAllowed, err := resolveLocalPath(allowed)
+		if err != nil {
+			continue
+		}
+		if resolvedPath == resolvedAllowed || strings.HasPrefix(resolvedPath, resolvedAllowed+string(os.PathSeparator)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func resolveLocalPath(path string) (string, error) {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	evaluated, err := filepath.EvalSymlinks(absolute)
+	if err == nil {
+		return filepath.Clean(evaluated), nil
+	}
+	return filepath.Clean(absolute), nil
 }
 
 func confirmLocalExecution(input io.Reader, output io.Writer, envelope MessageEnvelope, pluginName string) bool {
@@ -1124,31 +1452,31 @@ func handleEnvelope(envelope MessageEnvelope, pluginCommand string) ResultEnvelo
 		return failure(envelope, err.Error())
 	}
 
-	result, status, err := callPlugin(pluginCommand, envelope.Channel, payload)
+	callResult, err := callPlugin(pluginCommand, envelope.Channel, payload)
 	if err != nil {
 		return failure(envelope, err.Error())
 	}
 
-	return resultEnvelope(envelope, status, result)
+	return resultEnvelope(envelope, callResult.Status, callResult.Final)
 }
 
-func callPlugin(pluginCommand string, channel string, payload AppPayload) (PluginResultPayload, string, error) {
+func callPlugin(pluginCommand string, channel string, payload AppPayload) (pluginCallResult, error) {
 	parts := strings.Fields(pluginCommand)
 	if len(parts) == 0 {
-		return PluginResultPayload{}, "", errors.New("empty plugin command")
+		return pluginCallResult{}, errors.New("empty plugin command")
 	}
 	cmd := exec.Command(parts[0], parts[1:]...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return PluginResultPayload{}, "", err
+		return pluginCallResult{}, err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return PluginResultPayload{}, "", err
+		return pluginCallResult{}, err
 	}
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		return PluginResultPayload{}, "", err
+		return pluginCallResult{}, err
 	}
 
 	request := jsonRPCRequest{
@@ -1158,34 +1486,66 @@ func callPlugin(pluginCommand string, channel string, payload AppPayload) (Plugi
 		Params:  map[string]interface{}{"channel": channel, "payload": payload},
 	}
 	if err := json.NewEncoder(stdin).Encode(request); err != nil {
-		return PluginResultPayload{}, "", err
+		return pluginCallResult{}, err
 	}
 	_ = stdin.Close()
 
-	line, err := bufio.NewReader(stdout).ReadBytes('\n')
-	if err != nil {
-		return PluginResultPayload{}, "", err
-	}
-	_ = cmd.Process.Kill()
-	var response genericJSONRPCResponse
-	if err := json.Unmarshal(bytes.TrimSpace(line), &response); err != nil {
-		return PluginResultPayload{}, "", err
-	}
-	if response.Error != nil {
-		return PluginResultPayload{}, "", errors.New(response.Error.Message)
-	}
+	var events []PluginResultPayload
 	var handled messageHandleResult
-	if err := json.Unmarshal(response.Result, &handled); err != nil {
-		return PluginResultPayload{}, "", err
+	foundResponse := false
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var probe struct {
+			ID     *int            `json:"id,omitempty"`
+			Method string          `json:"method,omitempty"`
+			Params json.RawMessage `json:"params,omitempty"`
+		}
+		if err := json.Unmarshal(line, &probe); err != nil {
+			return pluginCallResult{}, err
+		}
+		if probe.Method == "musubi.message.event" {
+			var event messageHandleResult
+			if err := json.Unmarshal(probe.Params, &event); err != nil {
+				return pluginCallResult{}, err
+			}
+			events = append(events, PluginResultPayload{Type: "codex.task.event", Body: event.Body})
+			continue
+		}
+		var response genericJSONRPCResponse
+		if err := json.Unmarshal(line, &response); err != nil {
+			return pluginCallResult{}, err
+		}
+		if response.Error != nil {
+			return pluginCallResult{}, errors.New(response.Error.Message)
+		}
+		if err := json.Unmarshal(response.Result, &handled); err != nil {
+			return pluginCallResult{}, err
+		}
+		foundResponse = true
+	}
+	if err := scanner.Err(); err != nil {
+		return pluginCallResult{}, err
+	}
+	_ = cmd.Wait()
+	if !foundResponse {
+		return pluginCallResult{}, errors.New("plugin did not return a JSON-RPC response")
 	}
 	status := handled.Status
 	if status == "" {
 		status = "completed"
 	}
 	if status != "completed" && status != "failed" {
-		return PluginResultPayload{}, "", fmt.Errorf("plugin returned unsupported status %s", status)
+		return pluginCallResult{}, fmt.Errorf("plugin returned unsupported status %s", status)
 	}
-	return PluginResultPayload{Type: "task.result", Body: handled.Body}, status, nil
+	return pluginCallResult{
+		Final:  PluginResultPayload{Type: "task.result", Body: handled.Body},
+		Status: status,
+		Events: events,
+	}, nil
 }
 
 func failure(envelope MessageEnvelope, message string) ResultEnvelope {

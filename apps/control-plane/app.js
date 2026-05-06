@@ -1,6 +1,7 @@
 const state = {
   route: location.hash.replace("#", "") || "home",
   data: {},
+  createdApiKey: null,
   messageFilters: { app_id: "", device_id: "", status: "", channel: "" },
   auditFilters: { event_type: "", app_id: "", device_id: "" },
 };
@@ -48,6 +49,7 @@ async function api(path, options) {
 
 function render() {
   const [name, id] = state.route.split("/");
+  if (state.route === "apps/new") return renderNewApp();
   if (name === "devices" && id) return renderDevice(id);
   if (name === "apps" && id) return renderApp(id);
   if (name === "messages" && id) return renderMessage(id);
@@ -163,7 +165,10 @@ function renderApps() {
   root.innerHTML = `
     <section class="detail-layout apps-layout">
       <div class="detail-main">
-        ${panel("Apps", appTable(state.data.apps.apps), "table-panel")}
+        ${panel("Apps", `
+          <div class="panel-tools"><button class="primary" onclick="location.hash='apps/new'">New user-owned app</button></div>
+          ${appTable(state.data.apps.apps)}
+        `, "table-panel")}
       </div>
       <aside class="detail-rail">
         ${panel("Create Grant", grantForm(), "permission-panel")}
@@ -171,6 +176,40 @@ function renderApps() {
     </section>
   `;
   bindActions();
+}
+
+function renderNewApp() {
+  setHeader("New App", "Create a user-owned app identity from the CLI, then grant it explicit channels.");
+  const server = location.origin;
+  const command = `go run ./cmd/musubi app create "My Automation" --server ${server} --home .musubi/m3 --workspace ws_local --type user_owned --generate-key-local --env`;
+  root.innerHTML = `
+    <section class="detail-layout">
+      <div class="detail-main">
+        ${panel("Create User-owned App", `
+          <p class="notice inline">The CLI generates the app private key locally. Musubi stores the app public key and an API key hash only.</p>
+          <pre>${escapeHtml(command)}</pre>
+          <div class="toolbar">
+            <button class="primary" data-copy="${escapeHtml(command)}">Copy command</button>
+            <button onclick="location.hash='apps'">Back to apps</button>
+          </div>
+        `)}
+        ${panel("Next Step", `
+          <p class="muted">After the app appears in this list, create a grant for only the device and plugin channels it should be allowed to request.</p>
+        `)}
+      </div>
+      <aside class="detail-rail">
+        ${panel("SDK Environment", `
+          <div class="rail-kv">
+            ${kvItem("MUSUBI_API_BASE_URL", server)}
+            ${kvItem("MUSUBI_APP_ID", "printed by CLI")}
+            ${kvItem("MUSUBI_API_KEY", "printed once")}
+            ${kvItem("MUSUBI_APP_PRIVATE_KEY", "stored locally")}
+          </div>
+        `)}
+      </aside>
+    </section>
+  `;
+  bindCopy();
 }
 
 async function renderApp(id) {
@@ -196,6 +235,21 @@ async function renderApp(id) {
             ${kvItem("Public key fingerprint", fingerprint(detail.active_key?.public_key))}
           </div>
         `)}
+        ${panel("API Keys", `
+          <p class="notice inline">API key secrets are shown only when created. The server stores hashes and prefixes.</p>
+          ${state.createdApiKey?.appId === detail.app.id ? `
+            <div class="band revealed-secret">
+              <p class="muted">New API key secret</p>
+              <pre>${escapeHtml(state.createdApiKey.secret)}</pre>
+              <button data-copy="${escapeHtml(state.createdApiKey.secret)}">Copy secret</button>
+            </div>
+          ` : ""}
+          <div class="toolbar panel-tools">
+            <button class="primary" data-create-api-key="${detail.app.id}">Create API key</button>
+          </div>
+          ${apiKeyTable(detail.api_keys || [])}
+        `, "table-panel")}
+        ${panel("SDK Quickstart", sdkQuickstart(detail), "sdk-panel")}
         ${panel("Authorized Devices", grantTable(detail.grants), "table-panel")}
         ${panel("Messages", messageTable(detail.recent_messages), "table-panel")}
         ${panel("Audit", auditTable(detail.recent_audit_events), "table-panel")}
@@ -216,6 +270,7 @@ async function renderApp(id) {
     </section>
   `;
   bindActions();
+  bindCopy();
 }
 
 function renderMessages() {
@@ -369,6 +424,44 @@ function appTable(apps) {
   ]));
 }
 
+function apiKeyTable(keys) {
+  if (!keys.length) return empty("No API keys yet.");
+  return table(["Key", "Status", "Created At", "Last Used", "Actions"], keys.map((key) => [
+    resourceCell(key.name || key.id, `${key.prefix}...`),
+    badge(key.status),
+    timeCell(key.created_at),
+    timeCell(key.last_used_at),
+    key.status === "active" ? `<button class="danger" data-revoke-api-key="${key.id}">Revoke</button>` : "",
+  ]));
+}
+
+function sdkQuickstart(detail) {
+  const appId = detail.app.id;
+  const server = location.origin;
+  const snippet = `import { MusubiApp, echoPayload } from "./sdk/app-js/src/index.ts";
+
+const musubi = new MusubiApp({
+  apiBaseUrl: "${server}",
+  appId: "${appId}",
+  apiKey: process.env.MUSUBI_API_KEY!,
+  privateKey: process.env.MUSUBI_APP_PRIVATE_KEY!,
+  appKeyId: "${detail.active_key?.id || "appkey_001"}",
+});
+
+const [device] = await musubi.devices.listGranted();
+const invocation = await musubi.invoke({
+  deviceId: device.id,
+  channel: "echo.echo",
+  payload: echoPayload("hello from the SDK"),
+});
+console.log(await invocation.result());`;
+  return `
+    <p class="muted">Use an API key secret and the locally held app private key from the CLI output.</p>
+    <pre>${escapeHtml(snippet)}</pre>
+    <button data-copy="${escapeHtml(snippet)}">Copy SDK snippet</button>
+  `;
+}
+
 function grantTable(grants) {
   if (!grants.length) return empty("No grants yet.");
   return table(["App", "Device", "Channels", "Queueing", "Status", "Actions"], grants.map((grant) => [
@@ -518,6 +611,24 @@ function bindActions() {
   document.querySelectorAll("[data-revoke-device]").forEach((button) => {
     button.addEventListener("click", async () => {
       await api(`/v1/devices/${button.dataset.revokeDevice}/revoke`, { method: "POST" });
+      load();
+    });
+  });
+  document.querySelectorAll("[data-create-api-key]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const response = await api(`/v1/apps/${button.dataset.createApiKey}/api-keys`, {
+        method: "POST",
+        body: JSON.stringify({ name: "Control plane key" }),
+      });
+      state.createdApiKey = { appId: button.dataset.createApiKey, secret: response.api_key };
+      await load();
+    });
+  });
+  document.querySelectorAll("[data-revoke-api-key]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const appId = state.route.split("/")[1];
+      await api(`/v1/apps/${appId}/api-keys/${button.dataset.revokeApiKey}/revoke`, { method: "POST" });
+      state.createdApiKey = null;
       load();
     });
   });

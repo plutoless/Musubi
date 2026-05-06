@@ -7,6 +7,7 @@ import {
   allowedChannels,
   visibleEnvelopeLog,
 } from "../../../packages/protocol/src/index.ts";
+import { createHash, randomBytes } from "node:crypto";
 
 type DeviceSocket = ServerWebSocket<{ deviceId: string }>;
 
@@ -14,6 +15,7 @@ interface StoredMessage {
   envelope: MessageEnvelope;
   status: MessageState;
   result?: ResultEnvelope;
+  result_events: ResultEnvelope[];
   history: MessageState[];
   created_at: string;
   updated_at: string;
@@ -67,6 +69,19 @@ interface AppKeyRecord {
   public_key: string;
   status: "active" | "retired" | "revoked";
   created_at: string;
+}
+
+interface AppApiKeyRecord {
+  id: string;
+  app_id: string;
+  name: string;
+  prefix: string;
+  key_hash: string;
+  status: "active" | "revoked";
+  created_at: string;
+  last_used_at?: string;
+  revoked_at?: string;
+  revoked_by?: string;
 }
 
 interface GrantRecord {
@@ -128,6 +143,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
   const deviceKeys = new Map<string, DeviceKeyRecord>();
   const apps = new Map<string, AppRecord>();
   const appKeys = new Map<string, AppKeyRecord>();
+  const appApiKeys = new Map<string, AppApiKeyRecord>();
   const grants = new Map<string, GrantRecord>();
   const capabilities: DevicePluginCapabilityRecord[] = [];
   const auditEvents: AuditEventRecord[] = [];
@@ -224,6 +240,48 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     return checkGrant(envelope.workspace_id, envelope.app_id, envelope.device_id, envelope.channel);
   }
 
+  function appApiKeyView(key: AppApiKeyRecord) {
+    return {
+      id: key.id,
+      app_id: key.app_id,
+      name: key.name,
+      prefix: key.prefix,
+      status: key.status,
+      created_at: key.created_at,
+      last_used_at: key.last_used_at,
+      revoked_at: key.revoked_at,
+    };
+  }
+
+  function hashAppApiKey(secret: string) {
+    return createHash("sha256").update(secret).digest("hex");
+  }
+
+  function readBearer(req: Request): string | undefined {
+    const header = req.headers.get("authorization") ?? "";
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    return match?.[1];
+  }
+
+  function authenticateAppRequest(req: Request): { app: AppRecord; apiKey: AppApiKeyRecord } | Response {
+    const secret = readBearer(req);
+    if (!secret) return Response.json({ error: "missing app api key" }, { status: 401 });
+    const keyHash = hashAppApiKey(secret);
+    const apiKey = [...appApiKeys.values()].find((key) => key.key_hash === keyHash);
+    if (!apiKey || apiKey.status !== "active") {
+      return Response.json({ error: "invalid app api key" }, { status: 401 });
+    }
+    const app = apps.get(apiKey.app_id);
+    if (!app || app.status !== "active") return Response.json({ error: "app denied" }, { status: 403 });
+    apiKey.last_used_at = new Date().toISOString();
+    return { app, apiKey };
+  }
+
+  function rejectAppApiKeyOnControlPlane(req: Request): Response | undefined {
+    if (!readBearer(req)) return undefined;
+    return Response.json({ error: "app api keys cannot manage control plane resources" }, { status: 403 });
+  }
+
   function checkGrant(workspaceId: string, appId: string, deviceId: string, channel: string): string | undefined {
     const denied = grantDenied(workspaceId, appId, deviceId, channel);
     return denied;
@@ -277,10 +335,16 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
   }
 
   async function handleCreateMessage(req: Request): Promise<Response> {
+    const appAuth = readBearer(req) ? authenticateAppRequest(req) : undefined;
+    if (appAuth instanceof Response) return appAuth;
     const envelope = (await req.json()) as MessageEnvelope;
+    if (appAuth && envelope.app_id !== appAuth.app.id) {
+      return Response.json({ message_id: envelope.message_id, status: "failed", error: "app id mismatch" }, { status: 403 });
+    }
     messages.set(envelope.message_id, {
       envelope,
       status: "created",
+      result_events: [],
       history: ["created"],
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -327,6 +391,59 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     deviceSocket.send(JSON.stringify(envelope));
     transition(envelope.message_id, "delivered");
     return Response.json({ message_id: envelope.message_id, status: "delivered" });
+  }
+
+  async function handleCreateAppApiKey(req: Request, appId: string): Promise<Response> {
+    const app = apps.get(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    if (app.status !== "active") return Response.json({ error: "app revoked" }, { status: 409 });
+    const body = await req.json().catch(() => ({})) as { name?: string };
+    const suffix = String(appApiKeys.size + 1).padStart(3, "0");
+    const id = `appapikey_${suffix}`;
+    const secret = `musubi_app_sk_${randomBytes(24).toString("base64url")}`;
+    const key: AppApiKeyRecord = {
+      id,
+      app_id: appId,
+      name: body.name || "Default API key",
+      prefix: secret.slice(0, 18),
+      key_hash: hashAppApiKey(secret),
+      status: "active",
+      created_at: new Date().toISOString(),
+    };
+    appApiKeys.set(id, key);
+    audit("user", "user_local", "app_api_key.created", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_api_key_id: id, prefix: key.prefix },
+    });
+    return Response.json({ api_key: secret, key: appApiKeyView(key) });
+  }
+
+  function handleListAppApiKeys(appId: string): Response {
+    const app = apps.get(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    return Response.json({
+      api_keys: [...appApiKeys.values()]
+        .filter((key) => key.app_id === appId)
+        .map(appApiKeyView)
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    });
+  }
+
+  function handleRevokeAppApiKey(appId: string, apiKeyId: string): Response {
+    const app = apps.get(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const key = appApiKeys.get(apiKeyId);
+    if (!key || key.app_id !== appId) return Response.json({ error: "not found" }, { status: 404 });
+    key.status = "revoked";
+    key.revoked_at = new Date().toISOString();
+    key.revoked_by = "user_local";
+    audit("user", "user_local", "app_api_key.revoked", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_api_key_id: key.id },
+    });
+    return Response.json({ key: appApiKeyView(key) });
   }
 
   async function handleRegisterDevice(req: Request): Promise<Response> {
@@ -580,9 +697,12 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     return Response.json({ device_id: deviceId, status: "ok", plugins_reported: body.plugins?.length ?? 0 });
   }
 
-  async function handleCancelMessage(messageId: string): Promise<Response> {
+  async function handleCancelMessage(req: Request, messageId: string): Promise<Response> {
+    const auth = readBearer(req) ? authenticateAppRequest(req) : undefined;
+    if (auth instanceof Response) return auth;
     const item = messages.get(messageId);
     if (!item) return Response.json({ error: "not found" }, { status: 404 });
+    if (auth && item.envelope.app_id !== auth.app.id) return Response.json({ error: "not found" }, { status: 404 });
     if (item.status === "completed" || item.status === "failed" || item.status === "cancelled") {
       return Response.json({ message_id: messageId, status: item.status, error: "message already terminal" }, { status: 409 });
     }
@@ -648,8 +768,11 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     };
   }
 
-  function listMessages(url: URL) {
+  function listMessages(req: Request, url: URL) {
+    const auth = readBearer(req) ? authenticateAppRequest(req) : undefined;
+    if (auth instanceof Response) return auth;
     let rows = [...messages.values()].map(messageView).sort((a, b) => b.created_at.localeCompare(a.created_at));
+    if (auth) rows = rows.filter((row) => row.app_id === auth.app.id);
     for (const field of ["app_id", "device_id", "channel", "status"] as const) {
       const value = url.searchParams.get(field);
       if (value) rows = rows.filter((row) => row[field] === value);
@@ -724,6 +847,13 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     for (const key of appKeys.values()) {
       if (key.app_id === appId && key.status === "active") key.status = "revoked";
     }
+    for (const key of appApiKeys.values()) {
+      if (key.app_id === appId && key.status === "active") {
+        key.status = "revoked";
+        key.revoked_at = app.revoked_at;
+        key.revoked_by = "user_local";
+      }
+    }
     for (const grant of grants.values()) {
       if (grant.app_id === appId && !grant.revoked_at) {
         grant.revoked_at = app.revoked_at;
@@ -761,6 +891,63 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     return Response.json({ device_id: device.id, status: device.status });
   }
 
+  function handleListGrantedAppDevices(req: Request): Response {
+    const auth = authenticateAppRequest(req);
+    if (auth instanceof Response) return auth;
+    const rows = [...grants.values()]
+      .filter((grant) => grant.app_id === auth.app.id && !grant.revoked_at)
+      .map((grant) => {
+        const device = devices.get(grant.device_id);
+        return device ? {
+          id: device.id,
+          name: device.display_name ?? device.name,
+          status: device.status,
+          platform: device.platform,
+          workspace_id: device.workspace_id,
+          allowed_channels: grant.allowed_channels,
+          queueing_allowed: grant.queueing_allowed,
+          last_seen_at: device.last_seen_at,
+          last_capability_report_at: device.last_capability_report_at,
+        } : undefined;
+      })
+      .filter(Boolean);
+    return Response.json({ devices: rows });
+  }
+
+  function handleGetAppDevicePublicKey(req: Request, deviceId: string): Response {
+    const auth = authenticateAppRequest(req);
+    if (auth instanceof Response) return auth;
+    const device = devices.get(deviceId);
+    if (!device) return Response.json({ error: "not found" }, { status: 404 });
+    const grant = [...grants.values()].find((item) => item.app_id === auth.app.id && item.device_id === deviceId && !item.revoked_at);
+    if (!grant) return Response.json({ error: "grant denied" }, { status: 403 });
+    const activeKey = [...deviceKeys.values()].find((key) => key.device_id === deviceId && key.status === "active");
+    if (!activeKey) return Response.json({ error: "device key denied" }, { status: 404 });
+    return Response.json({
+      device_id: deviceId,
+      device_key_id: activeKey.id,
+      public_key: activeKey.public_key,
+      allowed_channels: grant.allowed_channels,
+    });
+  }
+
+  function handleMessageEvents(req: Request, messageId: string, url: URL): Response {
+    const auth = readBearer(req) ? authenticateAppRequest(req) : undefined;
+    if (auth instanceof Response) return auth;
+    const item = messages.get(messageId);
+    if (!item) return Response.json({ error: "not found" }, { status: 404 });
+    if (auth && item.envelope.app_id !== auth.app.id) return Response.json({ error: "not found" }, { status: 404 });
+    const cursor = Math.max(0, Number(url.searchParams.get("cursor") ?? 0));
+    const events = item.result_events.slice(cursor);
+    return Response.json({
+      message_id: item.envelope.message_id,
+      status: item.status,
+      cursor,
+      next_cursor: String(cursor + events.length),
+      events,
+    });
+  }
+
   async function serveControlPlane(pathname: string): Promise<Response> {
     const filePath = pathname === "/control-plane/app.js"
       ? "apps/control-plane/app.js"
@@ -780,8 +967,9 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
   const server = Bun.serve({
     hostname: options.hostname ?? process.env.MUSUBI_RELAY_HOST ?? "127.0.0.1",
     port: options.port ?? Number(process.env.MUSUBI_RELAY_PORT ?? "8787"),
-    fetch(req, server) {
+    async fetch(req, server) {
       const url = new URL(req.url);
+      try {
 
       if (url.pathname === "/" && req.method === "GET") {
         return Response.redirect(`${url.origin}/control-plane`, 302);
@@ -797,6 +985,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/devices" && req.method === "GET") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         let rows = [...devices.values()]
           .filter((device) => !url.searchParams.get("workspace_id") || device.workspace_id === url.searchParams.get("workspace_id"))
           .filter((device) => !url.searchParams.get("status") || device.status === url.searchParams.get("status"))
@@ -822,6 +1012,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/apps" && req.method === "GET") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         const rows = [...apps.values()].map((app) => {
           const activeGrants = [...grants.values()].filter((grant) => grant.app_id === app.id && !grant.revoked_at);
           return {
@@ -839,10 +1031,14 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/apps" && req.method === "POST") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         return handleCreateApp(req);
       }
 
       if (url.pathname === "/v1/grants" && req.method === "POST") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         return handleCreateGrant(req);
       }
 
@@ -857,15 +1053,21 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
 
       const grantRevokeMatch = url.pathname.match(/^\/v1\/grants\/([^/]+)\/revoke$/);
       if (grantRevokeMatch && req.method === "POST") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         return handleRevokeGrant(grantRevokeMatch[1]);
       }
 
       const grantPatchMatch = url.pathname.match(/^\/v1\/grants\/([^/]+)$/);
       if (grantPatchMatch && req.method === "PATCH") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         return handleUpdateGrant(req, grantPatchMatch[1]);
       }
 
       if (url.pathname === "/v1/grants" && req.method === "GET") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         let rows = [...grants.values()].map(grantView).sort((a, b) => a.id.localeCompare(b.id));
         for (const field of ["app_id", "device_id", "workspace_id"] as const) {
           const value = url.searchParams.get(field);
@@ -877,16 +1079,50 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
 
       const appRevokeMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/revoke$/);
       if (appRevokeMatch && req.method === "POST") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         return handleRevokeApp(appRevokeMatch[1]);
       }
 
       const deviceRevokeMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/revoke$/);
       if (deviceRevokeMatch && req.method === "POST") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         return handleRevokeDevice(deviceRevokeMatch[1]);
+      }
+
+      if (url.pathname === "/v1/app/devices" && req.method === "GET") {
+        return handleListGrantedAppDevices(req);
+      }
+
+      const appDeviceKeyMatch = url.pathname.match(/^\/v1\/app\/devices\/([^/]+)\/public-key$/);
+      if (appDeviceKeyMatch && req.method === "GET") {
+        return handleGetAppDevicePublicKey(req, appDeviceKeyMatch[1]);
+      }
+
+      const apiKeyMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/api-keys$/);
+      if (apiKeyMatch && req.method === "POST") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
+        return handleCreateAppApiKey(req, apiKeyMatch[1]);
+      }
+      if (apiKeyMatch && req.method === "GET") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
+        return handleListAppApiKeys(apiKeyMatch[1]);
+      }
+
+      const apiKeyRevokeMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/api-keys\/([^/]+)\/revoke$/);
+      if (apiKeyRevokeMatch && req.method === "POST") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
+        return handleRevokeAppApiKey(apiKeyRevokeMatch[1], apiKeyRevokeMatch[2]);
       }
 
       const appMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)$/);
       if (appMatch && req.method === "GET") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         const app = apps.get(appMatch[1]);
         if (!app) return Response.json({ error: "not found" }, { status: 404 });
         const active_key = [...appKeys.values()].find(
@@ -896,6 +1132,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         return Response.json({
           app,
           active_key,
+          api_keys: [...appApiKeys.values()].filter((key) => key.app_id === app.id).map(appApiKeyView),
           grants: appGrants,
           recent_messages: [...messages.values()].filter((item) => item.envelope.app_id === app.id).map(messageView).slice(-20).reverse(),
           recent_audit_events: auditEvents.filter((event) => event.app_id === app.id).slice(-50).reverse(),
@@ -904,6 +1141,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
 
       const deviceMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)$/);
       if (deviceMatch && req.method === "GET") {
+        const rejected = rejectAppApiKeyOnControlPlane(req);
+        if (rejected) return rejected;
         const device = devices.get(deviceMatch[1]);
         if (!device) return Response.json({ error: "not found" }, { status: 404 });
         const active_key = [...deviceKeys.values()].find(
@@ -929,23 +1168,32 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/messages" && req.method === "GET") {
-        return listMessages(url);
+        return listMessages(req, url);
       }
 
       const cancelMatch = url.pathname.match(/^\/v1\/messages\/([^/]+)\/cancel$/);
       if (cancelMatch && req.method === "POST") {
-        return handleCancelMessage(cancelMatch[1]);
+        return handleCancelMessage(req, cancelMatch[1]);
+      }
+
+      const eventsMatch = url.pathname.match(/^\/v1\/messages\/([^/]+)\/events$/);
+      if (eventsMatch && req.method === "GET") {
+        return handleMessageEvents(req, eventsMatch[1], url);
       }
 
       const messageMatch = url.pathname.match(/^\/v1\/messages\/([^/]+)$/);
       if (messageMatch && req.method === "GET") {
+        const auth = readBearer(req) ? authenticateAppRequest(req) : undefined;
+        if (auth instanceof Response) return auth;
         const item = messages.get(messageMatch[1]);
         if (!item) return Response.json({ error: "not found" }, { status: 404 });
+        if (auth && item.envelope.app_id !== auth.app.id) return Response.json({ error: "not found" }, { status: 404 });
         return Response.json({
           message_id: item.envelope.message_id,
           status: item.status,
           history: item.history,
           result: item.result,
+          result_events: item.result_events,
           message: messageView(item),
           status_events: messageStatusEvents.filter((event) => event.message_id === item.envelope.message_id),
           audit_events: auditEvents.filter((event) => event.message_id === item.envelope.message_id),
@@ -962,6 +1210,10 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       return Response.json({ ok: true, service: "musubi-relay", device_online: !!deviceSocket });
+      } catch (error) {
+        console.error("[relay] request failed", { path: url.pathname, error });
+        return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
+      }
     },
     websocket: {
       open(ws) {
@@ -997,7 +1249,9 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         console.log("[relay] received encrypted result", visibleEnvelopeLog(result));
         const item = messages.get(result.message_id);
         if (!item) return;
+        if (item.status === "completed" || item.status === "failed" || item.status === "cancelled") return;
         item.result = result;
+        item.result_events.push(result);
         transition(result.message_id, result.status);
       },
       close(ws) {

@@ -68,6 +68,7 @@ tools/
 - [M1.6 runtime hardening plan](docs/musubi_m_1_6_runtime_hardening_plan.md)
 - [M2 control plane](docs/control_plane_m2.md)
 - [M2 control plane plan](docs/musubi_m_2_control_plane_plan.md)
+- [M2.5 Codex adapter](docs/codex_adapter_m2_5.md)
 - [Hosted M1 deployment](docs/hosted_m1_deployment.md)
 - [Repository policy](docs/policy.md)
 
@@ -276,6 +277,32 @@ The local relay serves the control plane at:
 ```text
 http://127.0.0.1:8787/control-plane
 ```
+
+### M2.5 Codex Adapter Verification
+
+Run the local Codex adapter verifier:
+
+```bash
+bun run verify:m2.5-codex
+```
+
+The verifier uses a Codex-compatible mock command for CI, proves workspace allowlist rejection, encrypted progress/result return, timeline/audit privacy, missing-binary handling, and grant revocation.
+
+### M3 App SDK Verification
+
+Create user-owned app credentials with local key generation:
+
+```bash
+go run ./cmd/musubi app create "My Automation" --server http://127.0.0.1:8787 --home .musubi/m3 --workspace ws_local --type user_owned --generate-key-local --env
+```
+
+Run the SDK verifier:
+
+```bash
+bun run verify:m3-app-sdk
+```
+
+The verifier covers encrypted SDK invoke/events/result/cancel flows, hashed API keys, app-key scoping, revocation, and plaintext-free server records.
 
 ### Message States
 
