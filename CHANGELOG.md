@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added the Musubi M1.5 Codex plugin plan.
+
 ## M1 Baseline - 2026-05-07
 
 - Added Musubi M1 architecture, protocol, encryption, local policy, API, hosted deployment, and goal documents.

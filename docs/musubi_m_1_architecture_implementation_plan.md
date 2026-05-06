@@ -1952,6 +1952,10 @@ Goal:
 
 Prove Musubi can support an external coding-agent adapter without changing core CLI or relay.
 
+Detailed plan:
+
+- `docs/musubi_m_1_5_codex_plugin_plan.md`
+
 Channels:
 
 ```text

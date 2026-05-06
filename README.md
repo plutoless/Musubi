@@ -64,6 +64,7 @@ tools/
 
 - [Musubi PRD v1](docs/musubi_prd_v_1.md)
 - [M1 architecture](docs/architecture_m1.md)
+- [M1.5 Codex plugin plan](docs/musubi_m_1_5_codex_plugin_plan.md)
 - [Hosted M1 deployment](docs/hosted_m1_deployment.md)
 - [Repository policy](docs/policy.md)
 
