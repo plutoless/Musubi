@@ -418,6 +418,10 @@ h3 {
   margin: 0 14px 12px;
 }
 
+.table-panel .pagination-bar {
+  margin: 12px 14px 14px;
+}
+
 .table-panel > .empty-state {
   padding: 0 14px 14px;
 }
@@ -497,23 +501,34 @@ h3 {
 }
 
 .toolbar,
-.filter-bar {
+.filter-bar,
+.pagination-bar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
 
-.filter-bar {
+.filter-bar,
+.pagination-bar {
   border-radius: var(--radius-inner);
   background: var(--panel-2);
   box-shadow: inset 0 0 0 1px var(--line-soft);
   padding: 10px;
 }
 
-.filter-bar label {
+.filter-bar label,
+.pagination-bar label {
   min-width: 170px;
   flex: 1 1 170px;
+}
+
+.pagination-bar {
+  justify-content: flex-end;
+}
+
+.pagination-bar label {
+  max-width: 160px;
 }
 
 .table-wrap {

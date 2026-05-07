@@ -138,6 +138,8 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     throw new Error(`hosted M4 app route returned unexpected shape; deploy the current Worker code. Response: ${JSON.stringify(redactSecrets(app))}`);
   }
   if (!app.api_key?.startsWith("musubi_app_sk_")) throw new Error("hosted developer app did not return API key");
+  const seedAppId = app.app_id;
+  const seedAppApiKey = app.api_key;
   const extraKey = await postJson<any>(`${apiBaseUrl}/v1/developer/apps/${app.app_id}/api-keys`, { name: "Hosted verifier key" });
   if (!extraKey.api_key?.startsWith("musubi_app_sk_")) throw new Error("hosted app API key creation failed");
 
@@ -147,6 +149,60 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     reason: "Run queued hosted verifier task",
     queueing_requested: true,
   });
+  const extraDeviceKeys = generateX25519KeyPair();
+  const secondaryDevice = await postJson<any>(`${apiBaseUrl}/v1/devices/register`, {
+    workspace_id: workspace,
+    device_name: "Hosted M4 Device 2",
+    platform: "darwin-arm64",
+    cli_version: "0.1.0",
+    public_key: extraDeviceKeys.publicKey,
+  });
+  await postJson(`${apiBaseUrl}/v1/devices/${secondaryDevice.device_id}/capabilities`, {
+    plugins: [{
+      name: "echo",
+      version: "0.1.0",
+      channels: ["echo.task.echo"],
+      permissions: ["process.spawn"],
+      manifest: { trust_level: "official", signature_status: "verified" },
+    }],
+  });
+  const secondDeveloper = await postJson<any>(`${apiBaseUrl}/v1/developers`, { name: "Hosted M4 Developer 2", email: "hosted-m4-2@example.test" });
+  const secondPublisher = await postJson<any>(`${apiBaseUrl}/v1/publishers`, {
+    developer_id: secondDeveloper.developer.id,
+    display_name: "Hosted M4 Publisher 2",
+    website: "https://example2.test",
+    privacy_policy_url: "https://example2.test/privacy",
+  });
+  await patchJson(`${apiBaseUrl}/v1/publishers/${secondPublisher.publisher.id}`, { verification_status: "verified" });
+  const secondaryApp = await postJson<any>(`${apiBaseUrl}/v1/developer/apps`, {
+    workspace_id: workspace,
+    name: "Hosted M4 Secondary App",
+    publisher_id: secondPublisher.publisher.id,
+    public_key: generateX25519KeyPair().publicKey,
+    privacy_policy_url: "https://example2.test/privacy",
+  });
+  if (!secondaryApp.app_id) {
+    throw new Error(`hosted secondary app route returned unexpected shape; deploy the current Worker code. Response: ${JSON.stringify(redactSecrets(secondaryApp))}`);
+  }
+  await postJson(`${apiBaseUrl}/v1/developer/apps/${secondaryApp.app_id}/permission-declarations`, {
+    plugin_name: "hermes",
+    channels: ["hermes.task.create"],
+    reason: "Secondary app verification app",
+  });
+
+  await postJson(`${apiBaseUrl}/v1/grants`, {
+    workspace_id: workspace,
+    app_id: seedAppId,
+    device_id: secondaryDevice.device_id,
+    allowed_channels: ["hermes.task.create"],
+  });
+  await postJson(`${apiBaseUrl}/v1/grants`, {
+    workspace_id: workspace,
+    app_id: secondaryApp.app_id,
+    device_id: device.device_id,
+    allowed_channels: ["hermes.task.create"],
+  });
+
   const deniedConsent = await postJson<any>(`${apiBaseUrl}/v1/consent-requests`, {
     app_id: app.app_id,
     state: "deny",
@@ -178,12 +234,97 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     privateKey: appKeys.privateKey,
     workspaceId: workspace,
   });
-  const devices = await client.devices.listGranted();
-  if (devices.length !== 1 || devices[0].id !== device.device_id) throw new Error("hosted SDK did not list granted device");
   await client.invoke({
     deviceId: device.device_id,
     channel: "hermes.task.create",
-    payload: hermesPayload("HOSTED_M4_ENCRYPTED_PAYLOAD"),
+    payload: hermesPayload("HOSTED_M4_ENCRYPTED_PAYLOAD_1"),
+  });
+  const devices = await client.devices.listGranted();
+  if (!devices.length) throw new Error("hosted SDK did not list any granted device");
+  if (!devices.some((entry: { id: string }) => entry.id === device.device_id)) {
+    throw new Error("hosted SDK did not list primary granted device");
+  }
+  await client.invoke({
+    deviceId: device.device_id,
+    channel: "hermes.task.create",
+    payload: hermesPayload("HOSTED_M4_ENCRYPTED_PAYLOAD_2"),
+  });
+  const pagedListSeedParams = { requireNextCursor: true };
+  await expectPagedList(`${apiBaseUrl}/v1/devices?workspace_id=${workspace}`, "devices", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (row.workspace_id !== workspace) throw new Error("devices list failed workspace_id filter");
+      if (typeof row.plugin_count !== "number") throw new Error("devices list omitted plugin_count");
+      if (typeof row.authorized_app_count !== "number") throw new Error("devices list omitted authorized_app_count");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/apps?type=third_party&status=active`, "apps", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (row.type !== "third_party" || row.status !== "active") throw new Error("apps list failed filter on type/status");
+      if (typeof row.authorized_device_count !== "number") throw new Error("apps list omitted authorized_device_count");
+      if (typeof row.allowed_channel_count !== "number") throw new Error("apps list omitted allowed_channel_count");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/grants?app_id=${seedAppId}`, "grants", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (row.app_id !== seedAppId) throw new Error("grants list filter did not persist");
+      if (!row.app || !row.device) throw new Error("grants list missing app/device enrichment");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/messages?app_id=${seedAppId}`, "messages", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (row.app_id !== seedAppId) throw new Error("messages list filter did not persist");
+      if (!row.id) throw new Error("messages list omitted id");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/audit-events?event_type=message.created`, "audit_events", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (row.event_type !== "message.created") throw new Error("audit list filter did not persist");
+      if (!row.id) throw new Error("audit events missing id");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/device-plugin-capabilities`, "capabilities", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (!row.plugin_name || !row.device_id) throw new Error("device-plugin-capabilities row is missing enrichment");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/authorized-apps`, "authorized_apps", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (!row.app || !row.app.id) throw new Error("authorized apps missing app payload");
+      if (!Array.isArray(row.grants)) throw new Error("authorized apps missing grant list");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/developers?status=active`, "developers", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (row.status !== "active") throw new Error("developers filter did not persist");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/publishers?verification_status=verified`, "publishers", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (row.verification_status !== "verified") throw new Error("publishers filter did not persist");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/apps/${seedAppId}/api-keys`, "api_keys", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (row.app_id !== seedAppId) throw new Error("app api keys list omitted app_id");
+    },
+  });
+  await expectPagedList(`${apiBaseUrl}/v1/app/devices`, "devices", {
+    ...pagedListSeedParams,
+    validateRow: (row) => {
+      if (!row.id) throw new Error("app devices list omitted id");
+      if (!Array.isArray(row.allowed_channels)) throw new Error("app devices list missing allowed_channels");
+    },
+    requestJson: (url) => requestJsonWithApiKey(url, seedAppApiKey),
   });
 
   await patchJson(`${apiBaseUrl}/v1/publishers/${publisher.publisher.id}`, { verification_status: "suspended" });
@@ -268,8 +409,62 @@ async function expectDenied(fn: () => Promise<unknown>, message: string) {
   }
 }
 
+type RequestJsonFn = (url: string) => Promise<any>;
+
+interface PagedListExpectOptions {
+  requireNextCursor?: boolean;
+  requestJson?: RequestJsonFn;
+  idForRow?: (row: any) => string;
+  validateRow?: (row: any) => void;
+}
+
+async function expectPagedList(url: string, key: string, options: PagedListExpectOptions = {}) {
+  const requestJsonFn = options.requestJson ?? requestJson;
+  const idForRow = options.idForRow ?? ((row: unknown) => (row as { id?: string })?.id ?? "");
+  const firstUrl = new URL(url);
+  firstUrl.searchParams.set("limit", "1");
+  const first = await requestJsonFn(firstUrl.toString()) as Record<string, unknown>;
+  const firstRows = Array.isArray(first[key]) ? first[key] as unknown[] : [];
+  if (firstRows.length !== 1) {
+    throw new Error(`${key} first page did not honor limit=1 (received ${firstRows.length})`);
+  }
+  for (const row of firstRows) {
+    options.validateRow?.(row);
+  }
+  if (options.requireNextCursor && typeof first.next_cursor !== "string") {
+    throw new Error(`${key} first page did not return next_cursor`);
+  }
+  if (!first.next_cursor) return;
+
+  const secondUrl = new URL(url);
+  secondUrl.searchParams.set("limit", "1");
+  secondUrl.searchParams.set("cursor", String(first.next_cursor));
+  const second = await requestJsonFn(secondUrl.toString()) as Record<string, unknown>;
+  const secondRows = Array.isArray(second[key]) ? second[key] as unknown[] : [];
+  if (secondRows.length !== 1) {
+    throw new Error(`${key} second page did not honor limit=1 (received ${secondRows.length})`);
+  }
+  for (const row of secondRows) {
+    options.validateRow?.(row);
+  }
+  const firstId = idForRow(firstRows[0]);
+  const secondId = idForRow(secondRows[0]);
+  if (firstId && secondId && firstId === secondId) {
+    throw new Error(`${key} pagination cursor returned duplicated row`);
+  }
+}
+
 async function requestJson<T>(url: string): Promise<T> {
   const response = await fetch(url);
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`GET ${url} failed: ${response.status} ${JSON.stringify(json)}`);
+  return json as T;
+}
+
+async function requestJsonWithApiKey<T>(url: string, apiKey: string): Promise<T> {
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
   const json = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(`GET ${url} failed: ${response.status} ${JSON.stringify(json)}`);
   return json as T;

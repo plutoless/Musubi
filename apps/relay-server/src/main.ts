@@ -688,14 +688,18 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     return Response.json({ api_key: secret, key: appApiKeyView(key) });
   }
 
-  function handleListAppApiKeys(appId: string): Response {
+  function handleListAppApiKeys(appId: string, url: URL): Response {
     const app = apps.get(appId);
     if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const rows = [...appApiKeys.values()]
+      .filter((key) => key.app_id === appId)
+      .map(appApiKeyView)
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const { page, next_cursor, limit } = paginate(rows, url);
     return Response.json({
-      api_keys: [...appApiKeys.values()]
-        .filter((key) => key.app_id === appId)
-        .map(appApiKeyView)
-        .sort((a, b) => a.id.localeCompare(b.id)),
+      api_keys: page,
+      next_cursor,
+      limit,
     });
   }
 
@@ -1258,11 +1262,26 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
   }
 
   function paginate<T>(items: T[], url: URL) {
-    const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit") ?? 50), 100));
-    const cursor = Math.max(0, Number(url.searchParams.get("cursor") ?? 0));
+    const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit") ?? 100), 500));
+    const decoded = decodeCursor(url.searchParams.get("cursor"));
+    const cursor = typeof decoded?.offset === "number" && decoded.offset > 0 ? Math.floor(decoded.offset) : 0;
     const page = items.slice(cursor, cursor + limit);
-    const next_cursor = cursor + limit < items.length ? String(cursor + limit) : null;
-    return { page, next_cursor };
+    const next_cursor = cursor + limit < items.length ? encodeCursor({ offset: cursor + limit }) : null;
+    return { page, next_cursor, limit };
+  }
+
+  function encodeCursor(value: Record<string, unknown>): string {
+    return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+  }
+
+  function decodeCursor(value: string | null): Record<string, unknown> | null {
+    if (!value) return null;
+    try {
+      const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+      return decoded && typeof decoded === "object" ? decoded : null;
+    } catch {
+      return null;
+    }
   }
 
   function latestCapabilitiesFor(deviceId: string) {
@@ -1323,8 +1342,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       const value = url.searchParams.get(field);
       if (value) rows = rows.filter((row) => row[field] === value);
     }
-    const { page, next_cursor } = paginate(rows, url);
-    return Response.json({ messages: page, next_cursor });
+    const { page, next_cursor, limit } = paginate(rows, url);
+    return Response.json({ messages: page, next_cursor, limit });
   }
 
   function listAuditEvents(url: URL) {
@@ -1333,8 +1352,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       const value = url.searchParams.get(field);
       if (value) rows = rows.filter((row) => row[field] === value);
     }
-    const { page, next_cursor } = paginate(rows, url);
-    return Response.json({ audit_events: page, next_cursor });
+    const { page, next_cursor, limit } = paginate(rows, url);
+    return Response.json({ audit_events: page, next_cursor, limit });
   }
 
   function supportedChannelWarning(deviceId: string, requestedChannels: string[]) {
@@ -1478,18 +1497,20 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     return Response.json({ app: appView(app) });
   }
 
-  function listAuthorizedApps(): Response {
+  function listAuthorizedApps(url: URL): Response {
     const rows = [...apps.values()]
       .filter((app) => app.type === "third_party")
       .map((app) => ({
         app: appView(app),
         grants: [...grants.values()].filter((grant) => grant.app_id === app.id).map(grantView),
         reports: abuseReports.filter((report) => report.app_id === app.id),
-      }));
-    return Response.json({ authorized_apps: rows, apps: rows });
+      }))
+      .sort((a, b) => a.app.id.localeCompare(b.app.id));
+    const { page, next_cursor, limit } = paginate(rows, url);
+    return Response.json({ authorized_apps: page, apps: page, next_cursor, limit });
   }
 
-  function handleListGrantedAppDevices(req: Request): Response {
+  function handleListGrantedAppDevices(req: Request, url: URL): Response {
     const auth = authenticateAppRequest(req);
     if (auth instanceof Response) return auth;
     const rows = [...grants.values()]
@@ -1508,8 +1529,10 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
           last_capability_report_at: device.last_capability_report_at,
         } : undefined;
       })
-      .filter(Boolean);
-    return Response.json({ devices: rows });
+      .filter(Boolean)
+      .sort((a, b) => String((a as any).id).localeCompare(String((b as any).id)));
+    const { page, next_cursor, limit } = paginate(rows, url);
+    return Response.json({ devices: page, next_cursor, limit });
   }
 
   function handleGetAppDevicePublicKey(req: Request, deviceId: string): Response {
@@ -1601,8 +1624,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
             created_at: device.created_at,
           }))
           .sort((a, b) => a.id.localeCompare(b.id));
-        const { page, next_cursor } = paginate(rows, url);
-        return Response.json({ devices: page, next_cursor });
+        const { page, next_cursor, limit } = paginate(rows, url);
+        return Response.json({ devices: page, next_cursor, limit });
       }
 
       if (url.pathname === "/v1/devices/register" && req.method === "POST") {
@@ -1612,7 +1635,11 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       if (url.pathname === "/v1/apps" && req.method === "GET") {
         const rejected = rejectAppApiKeyOnControlPlane(req);
         if (rejected) return rejected;
-        const rows = [...apps.values()].map((app) => {
+        const rows = [...apps.values()]
+          .filter((app) => !url.searchParams.get("type") || app.type === url.searchParams.get("type"))
+          .filter((app) => !url.searchParams.get("status") || app.status === url.searchParams.get("status"))
+          .filter((app) => !url.searchParams.get("workspace_id") || app.workspace_id === url.searchParams.get("workspace_id"))
+          .map((app) => {
           const activeGrants = [...grants.values()].filter((grant) => grant.app_id === app.id && !grant.revoked_at);
           return {
             id: app.id,
@@ -1627,8 +1654,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
             created_at: app.created_at,
           };
         }).sort((a, b) => a.id.localeCompare(b.id));
-        const { page, next_cursor } = paginate(rows, url);
-        return Response.json({ apps: page, next_cursor });
+        const { page, next_cursor, limit } = paginate(rows, url);
+        return Response.json({ apps: page, next_cursor, limit });
       }
 
       if (url.pathname === "/v1/apps" && req.method === "POST") {
@@ -1642,7 +1669,9 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/developers" && req.method === "GET") {
-        return Response.json({ developers: [...developers.values()].sort((a, b) => a.id.localeCompare(b.id)) });
+        const rows = [...developers.values()].sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+        const { page, next_cursor, limit } = paginate(rows, url);
+        return Response.json({ developers: page, next_cursor, limit });
       }
 
       const developerMatch = url.pathname.match(/^\/v1\/developers\/([^/]+)$/);
@@ -1655,7 +1684,9 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/publishers" && req.method === "GET") {
-        return Response.json({ publishers: [...publishers.values()].sort((a, b) => a.id.localeCompare(b.id)) });
+        const rows = [...publishers.values()].sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+        const { page, next_cursor, limit } = paginate(rows, url);
+        return Response.json({ publishers: page, next_cursor, limit });
       }
 
       const publisherMatch = url.pathname.match(/^\/v1\/publishers\/([^/]+)$/);
@@ -1750,8 +1781,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
           const value = url.searchParams.get(field);
           if (value) rows = rows.filter((row) => row[field] === value);
         }
-        const { page, next_cursor } = paginate(rows, url);
-        return Response.json({ grants: page, next_cursor });
+        const { page, next_cursor, limit } = paginate(rows, url);
+        return Response.json({ grants: page, next_cursor, limit });
       }
 
       const appRevokeMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/revoke$/);
@@ -1772,11 +1803,16 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/authorized-apps" && req.method === "GET") {
-        return listAuthorizedApps();
+        return listAuthorizedApps(url);
       }
 
       if (url.pathname === "/v1/plugins" && req.method === "GET") {
-        return Response.json({ plugins: ["echo", "hermes", "codex", "community-signed", "community-unsigned"].map((name) => registryPluginResponse(name)?.plugin).filter(Boolean) });
+        const plugins = ["echo", "hermes", "codex", "community-signed", "community-unsigned"]
+          .map((name) => registryPluginResponse(name)?.plugin)
+          .filter(Boolean)
+          .sort((a, b) => a.name.localeCompare(b.name));
+        const { page, next_cursor, limit } = paginate(plugins, url);
+        return Response.json({ plugins: page, next_cursor, limit });
       }
 
       const pluginVersionMatch = url.pathname.match(/^\/v1\/plugins\/([^/]+)\/versions\/([^/]+)$/);
@@ -1828,7 +1864,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/app/devices" && req.method === "GET") {
-        return handleListGrantedAppDevices(req);
+        return handleListGrantedAppDevices(req, url);
       }
 
       const appDeviceKeyMatch = url.pathname.match(/^\/v1\/app\/devices\/([^/]+)\/public-key$/);
@@ -1845,7 +1881,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       if (apiKeyMatch && req.method === "GET") {
         const rejected = rejectAppApiKeyOnControlPlane(req);
         if (rejected) return rejected;
-        return handleListAppApiKeys(apiKeyMatch[1]);
+        return handleListAppApiKeys(apiKeyMatch[1], url);
       }
 
       const apiKeyRevokeMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/api-keys\/([^/]+)\/revoke$/);
@@ -1942,7 +1978,12 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/device-plugin-capabilities" && req.method === "GET") {
-        return Response.json({ capabilities });
+        const deviceId = url.searchParams.get("device_id");
+        const rows = capabilities
+          .filter((capability) => !deviceId || capability.device_id === deviceId)
+          .sort((a, b) => `${b.reported_at}:${b.id}`.localeCompare(`${a.reported_at}:${a.id}`));
+        const { page, next_cursor, limit } = paginate(rows, url);
+        return Response.json({ capabilities: page, next_cursor, limit });
       }
 
       return Response.json({ ok: true, service: "musubi-relay", device_online: !!deviceSocket });

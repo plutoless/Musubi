@@ -71,6 +71,58 @@ try {
   if (editedGrant.grant?.queueing_allowed !== true) {
     throw new Error("grant edit did not update queueing flag");
   }
+  const seededDeveloper = await postJson<any>(`${serverUrl}/v1/developers`, {
+    name: "M2 Verify Developer",
+    email: "third-party@m2.verify",
+  });
+  const seededPublisher = await postJson<any>(`${serverUrl}/v1/publishers`, {
+    developer_id: seededDeveloper.developer.id,
+    display_name: "M2 Verify Publisher",
+    website: "https://example.test",
+    privacy_policy_url: "https://example.test/privacy",
+  });
+  await postJson(`${serverUrl}/v1/publishers/${seededPublisher.publisher.id}`, { verification_status: "verified" });
+  const seededSecondDeveloper = await postJson<any>(`${serverUrl}/v1/developers`, {
+    name: "M2 Verify Developer 2",
+    email: "third-party-2@m2.verify",
+  });
+  const seededSecondPublisher = await postJson<any>(`${serverUrl}/v1/publishers`, {
+    developer_id: seededSecondDeveloper.developer.id,
+    display_name: "M2 Verify Publisher 2",
+    website: "https://example-2.test",
+    privacy_policy_url: "https://example-2.test/privacy",
+  });
+  const thirdPartyAppOne = await postJson<any>(`${serverUrl}/v1/developer/apps`, {
+    workspace_id: workspaceId,
+    name: "M2 Verify Third-party App One",
+    publisher_id: seededPublisher.publisher.id,
+    public_key: "m2_verify_partner_public_key_1",
+  });
+  const thirdPartyAppTwo = await postJson<any>(`${serverUrl}/v1/developer/apps`, {
+    workspace_id: workspaceId,
+    name: "M2 Verify Third-party App Two",
+    publisher_id: seededSecondPublisher.publisher.id,
+    public_key: "m2_verify_partner_public_key_2",
+  });
+  await postJson(`${serverUrl}/v1/apps/${thirdPartyAppOne.app_id}/api-keys`, { name: "Verifier extra key 1" });
+  await postJson(`${serverUrl}/v1/apps/${thirdPartyAppOne.app_id}/api-keys`, { name: "Verifier extra key 2" });
+  await postJson(`${serverUrl}/v1/grants`, {
+    workspace_id: workspaceId,
+    app_id: thirdPartyAppOne.app_id,
+    device_id: "dev_001",
+    allowed_channels: ["hermes.task.create"],
+  });
+  await postJson(`${serverUrl}/v1/grants`, {
+    workspace_id: workspaceId,
+    app_id: thirdPartyAppTwo.app_id,
+    device_id: "dev_001",
+    allowed_channels: ["hermes.task.create"],
+  });
+  const secondSend = await run("go", sendArgs("app_001", "hermes.task.create", "M2_SECOND_MESSAGE"));
+  const secondMessageId = requiredMatch(secondSend, /(msg_m1_\d+)/, "second message id");
+  if (!secondMessageId) {
+    throw new Error("second Hermes message send did not return a message id");
+  }
 
   const completedOutput = await run("go", sendArgs("app_001", "hermes.task.create", prompt));
   if (!completedOutput.includes("completed")) throw new Error("Hermes task did not complete through M1 flow");
@@ -97,6 +149,17 @@ try {
   if (!audit.audit_events.find((event: { event_type: string }) => event.event_type === "message.completed")) {
     throw new Error("audit did not include message.completed");
   }
+  await expectPagedList(`${serverUrl}/v1/device-plugin-capabilities`, "capabilities");
+  await expectPagedList(`${serverUrl}/v1/audit-events`, "audit_events");
+  await expectPagedList(`${serverUrl}/v1/devices`, "devices");
+  await expectPagedList(`${serverUrl}/v1/apps`, "apps", true);
+  await expectPagedList(`${serverUrl}/v1/grants`, "grants", true);
+  await expectPagedList(`${serverUrl}/v1/messages?app_id=app_001`, "messages", true);
+  await expectPagedList(`${serverUrl}/v1/developers`, "developers", true);
+  await expectPagedList(`${serverUrl}/v1/publishers`, "publishers", true);
+  await expectPagedList(`${serverUrl}/v1/authorized-apps`, "authorized_apps", true);
+  await expectPagedList(`${serverUrl}/v1/apps/${thirdPartyAppOne.app_id}/api-keys`, "api_keys", true);
+  await expectPagedList(`${serverUrl}/v1/plugins`, "plugins");
 
   await postJson(`${serverUrl}/v1/grants/${grantId}/revoke`, {});
   await expectSendDenied("app_001", "hermes.task.create", "M2_GRANT_REVOKED_SECRET", "grant denied");
@@ -111,15 +174,17 @@ try {
   await postJson(`${serverUrl}/v1/apps/app_001/revoke`, {});
   await expectSendDenied("app_001", "hermes.task.create", "M2_APP_REVOKED_SECRET", "app denied");
 
-  await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Device Revoke Test", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
+  const revokeDeviceAppOutput = await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Device Revoke Test", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
+  const revokeDeviceAppId = requiredMatch(revokeDeviceAppOutput, /created app (app_\d+)/, "device revoke app id");
+  await expectPagedList(`${serverUrl}/v1/apps`, "apps");
   await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: workspaceId,
-    app_id: "app_002",
+    app_id: revokeDeviceAppId,
     device_id: "dev_001",
     allowed_channels: ["hermes.task.create"],
   });
   await postJson(`${serverUrl}/v1/devices/dev_001/revoke`, {});
-  await expectSendDenied("app_002", "hermes.task.create", "M2_DEVICE_REVOKED_SECRET", "device revoked");
+  await expectSendDenied(revokeDeviceAppId, "hermes.task.create", "M2_DEVICE_REVOKED_SECRET", "device revoked");
   const revokedDevice = await requestJson(`${serverUrl}/v1/devices/dev_001`);
   if (revokedDevice.device.status !== "revoked") throw new Error("device detail did not show revoked status");
 
@@ -259,6 +324,29 @@ function assertNoPlaintext(value: unknown, label: string) {
   const serialized = JSON.stringify(value);
   for (const needle of [prompt, "M2_GRANT_REVOKED_SECRET", "M2_APP_REVOKED_SECRET", "M2_DEVICE_REVOKED_SECRET"]) {
     if (serialized.includes(needle)) throw new Error(`${label} leaked plaintext needle ${needle}`);
+  }
+}
+
+async function expectPagedList(url: string, key: string, requireNextCursor = false) {
+  const firstUrl = new URL(url);
+  firstUrl.searchParams.set("limit", "1");
+  const first = await requestJson(firstUrl.toString());
+  if (!Array.isArray(first[key]) || first[key].length !== 1) {
+    throw new Error(`${key} first page did not honor limit=1`);
+  }
+  if (requireNextCursor && (!first.next_cursor || typeof first.next_cursor !== "string")) {
+    throw new Error(`${key} first page did not return next_cursor`);
+  }
+  if (!first.next_cursor) return;
+  const secondUrl = new URL(url);
+  secondUrl.searchParams.set("limit", "1");
+  secondUrl.searchParams.set("cursor", first.next_cursor);
+  const second = await requestJson(secondUrl.toString());
+  if (!Array.isArray(second[key]) || second[key].length !== 1) {
+    throw new Error(`${key} second page did not honor limit=1`);
+  }
+  if (JSON.stringify(second[key][0]) === JSON.stringify(first[key][0])) {
+    throw new Error(`${key} cursor returned the same row twice`);
   }
 }
 

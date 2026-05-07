@@ -38,7 +38,34 @@ if (!css.includes(".shell") || !css.includes(".sidebar")) {
   throw new Error("control plane styles.css did not include expected layout styles");
 }
 
-console.log("[control-plane-deployed] ok: deployed control plane is protected and static assets load");
+for (const path of [
+  "/v1/devices",
+  "/v1/apps",
+  "/v1/messages",
+  "/v1/audit-events",
+  "/v1/device-plugin-capabilities",
+  "/v1/authorized-apps",
+]) {
+  await json(`${serverUrl}${path}`, headers);
+}
+
+const plugins = await json(`${serverUrl}/v1/plugins`, headers) as { plugins?: Array<{ name?: string; signature_status?: string }> };
+if (!plugins.plugins?.find((plugin) => plugin.name === "codex" && plugin.signature_status === "verified")) {
+  throw new Error("control plane plugin registry did not include verified codex plugin");
+}
+
+const pluginPolicy = await json(`${serverUrl}/v1/workspace/plugin-policy`, headers) as {
+  policy?: { require_signature?: boolean; allowed_trust_levels?: string[]; blocked_plugins?: string[] };
+};
+if (
+  pluginPolicy.policy?.require_signature !== true ||
+  !pluginPolicy.policy.allowed_trust_levels?.includes("official") ||
+  !Array.isArray(pluginPolicy.policy.blocked_plugins)
+) {
+  throw new Error(`control plane plugin policy had unexpected shape: ${JSON.stringify(pluginPolicy)}`);
+}
+
+console.log("[control-plane-deployed] ok: deployed control plane is protected, static assets load, and startup APIs respond");
 process.exit(0);
 
 async function text(url: string, headers: Record<string, string>) {
@@ -48,4 +75,17 @@ async function text(url: string, headers: Record<string, string>) {
     throw new Error(`${url} failed with HTTP ${response.status}: ${body.slice(0, 200)}`);
   }
   return body;
+}
+
+async function json(url: string, headers: Record<string, string>) {
+  const response = await fetch(url, { headers });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`${url} failed with HTTP ${response.status}: ${body.slice(0, 200)}`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error(`${url} did not return JSON: ${body.slice(0, 200)}`);
+  }
 }
