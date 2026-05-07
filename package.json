@@ -38,6 +38,7 @@
     "verify:m4-platform-trust": "bun run tools/verify_m4_platform_trust.ts",
     "verify:m4-hosted-local": "bun run tools/verify_m4_hosted_local.ts",
     "verify:m4-hosted-deployed": "bun run tools/verify_m4_hosted_deployed.ts",
+    "verify:control-plane:deployed": "bun run tools/verify_control_plane_deployed.ts",
     "verify:production-smoke": "bun run tools/verify_production_smoke.ts",
     "verify:m1-readiness": "bun run tools/verify_m1_readiness.ts"
   },

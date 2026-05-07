@@ -12,6 +12,10 @@ interface DurableObjectNamespace<T> {
   get(id: DurableObjectId): DurableObjectStub<T>;
 }
 
+interface Fetcher {
+  fetch(request: Request): Promise<Response>;
+}
+
 interface DurableObjectId {}
 
 interface DurableObjectStub<T> {

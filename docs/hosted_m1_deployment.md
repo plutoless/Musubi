@@ -10,6 +10,7 @@ This runbook describes the hosted target for Musubi M1: Cloudflare Workers, a Du
 - `NEON_DATABASE_URL` stored as a Wrangler secret for each Worker environment:
   - production/default Worker: `musubi-m1`
   - staging Worker: `musubi-m1-staging`
+- `CONTROL_PLANE_BASIC_AUTH` stored as a Wrangler secret for staging if the hosted control-plane UI is enabled. The value is a `username:password` string used for HTTP Basic Auth.
 
 Local tooling check:
 
@@ -91,6 +92,7 @@ Staging deploys the Wrangler environment Worker `musubi-m1-staging`:
 ```bash
 cd server/workers
 TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler secret put NEON_DATABASE_URL --env staging
+TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler secret put CONTROL_PLANE_BASIC_AUTH --env staging
 TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler deploy --env staging
 ```
 
@@ -112,6 +114,15 @@ Expected:
 ```
 
 Staging should report `"env": "staging"`.
+
+The hosted control-plane UI is enabled only for staging by default:
+
+```bash
+curl -i https://<staging-worker-host>/control-plane
+curl -u '<username>:<password>' https://<staging-worker-host>/control-plane
+```
+
+The anonymous request should return `401`. The authenticated request should return the Musubi Control Plane HTML shell.
 
 Build check without deploying:
 
@@ -162,6 +173,10 @@ bun run verify:slice13:deployed
 MUSUBI_HOSTED_URL="https://<staging-worker-host>" \
 NEON_DATABASE_URL="<staging-postgres-url>" \
 bun run verify:m4-hosted-deployed
+
+MUSUBI_HOSTED_URL="https://<staging-worker-host>" \
+CONTROL_PLANE_BASIC_AUTH="<username>:<password>" \
+bun run verify:control-plane:deployed
 ```
 
 Production should use only the smoke verifier because the full deployed suite creates apps, grants, consent requests, reports, suspensions, messages, and audit rows:
@@ -180,10 +195,11 @@ Required GitHub secrets:
 - `CLOUDFLARE_ACCOUNT_ID`
 - `STAGING_NEON_DATABASE_URL`
 - `STAGING_MUSUBI_HOSTED_URL`
+- `STAGING_CONTROL_PLANE_BASIC_AUTH`
 - `PROD_NEON_DATABASE_URL`
 - `PROD_MUSUBI_HOSTED_URL`
 
-CI does not run `wrangler secret put`; configure each Worker's `NEON_DATABASE_URL` secret in Cloudflare before deployment.
+CI does not run `wrangler secret put`; configure each Worker's `NEON_DATABASE_URL` secret in Cloudflare before deployment. Configure the staging Worker's `CONTROL_PLANE_BASIC_AUTH` secret before enabling the protected control-plane verifier.
 
 Manual Neon checks:
 

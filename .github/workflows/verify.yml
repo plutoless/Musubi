@@ -90,14 +90,15 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NEON_DATABASE_URL: ${{ secrets.STAGING_NEON_DATABASE_URL }}
       MUSUBI_HOSTED_URL: ${{ secrets.STAGING_MUSUBI_HOSTED_URL }}
+      CONTROL_PLANE_BASIC_AUTH: ${{ secrets.STAGING_CONTROL_PLANE_BASIC_AUTH }}
 
     steps:
       - name: Check required staging secrets
         run: |
           missing=0
-          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN NEON_DATABASE_URL MUSUBI_HOSTED_URL; do
+          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN NEON_DATABASE_URL MUSUBI_HOSTED_URL CONTROL_PLANE_BASIC_AUTH; do
             if [ -z "${!name}" ]; then
-              echo "::error::$name is required for staging deploy. Configure CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, STAGING_NEON_DATABASE_URL, and STAGING_MUSUBI_HOSTED_URL."
+              echo "::error::$name is required for staging deploy. Configure CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, STAGING_NEON_DATABASE_URL, STAGING_MUSUBI_HOSTED_URL, and STAGING_CONTROL_PLANE_BASIC_AUTH."
               missing=1
             fi
           done
@@ -136,14 +137,15 @@ jobs:
     env:
       NEON_DATABASE_URL: ${{ secrets.STAGING_NEON_DATABASE_URL }}
       MUSUBI_HOSTED_URL: ${{ secrets.STAGING_MUSUBI_HOSTED_URL }}
+      CONTROL_PLANE_BASIC_AUTH: ${{ secrets.STAGING_CONTROL_PLANE_BASIC_AUTH }}
 
     steps:
       - name: Check required staging verifier secrets
         run: |
           missing=0
-          for name in NEON_DATABASE_URL MUSUBI_HOSTED_URL; do
+          for name in NEON_DATABASE_URL MUSUBI_HOSTED_URL CONTROL_PLANE_BASIC_AUTH; do
             if [ -z "${!name}" ]; then
-              echo "::error::$name is required for staging verification. Configure STAGING_NEON_DATABASE_URL and STAGING_MUSUBI_HOSTED_URL."
+              echo "::error::$name is required for staging verification. Configure STAGING_NEON_DATABASE_URL, STAGING_MUSUBI_HOSTED_URL, and STAGING_CONTROL_PLANE_BASIC_AUTH."
               missing=1
             fi
           done
@@ -177,6 +179,7 @@ jobs:
           bun run verify:slice12:deployed
           bun run verify:slice13:deployed
           bun run verify:m4-hosted-deployed
+          bun run verify:control-plane:deployed
 
   deploy-production:
     name: Deploy Production

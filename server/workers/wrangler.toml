@@ -2,6 +2,11 @@ name = "musubi-m1"
 main = "src/index.ts"
 compatibility_date = "2026-05-06"
 
+[assets]
+directory = "../../apps/control-plane"
+binding = "ASSETS"
+run_worker_first = true
+
 [[durable_objects.bindings]]
 name = "DEVICE_SESSION"
 class_name = "DeviceSession"
@@ -12,6 +17,7 @@ new_sqlite_classes = ["DeviceSession"]
 
 [vars]
 MUSUBI_ENV = "production"
+CONTROL_PLANE_ENABLED = "false"
 
 [env.staging]
 
@@ -21,6 +27,8 @@ class_name = "DeviceSession"
 
 [env.staging.vars]
 MUSUBI_ENV = "staging"
+CONTROL_PLANE_ENABLED = "true"
 
 # Configure in Cloudflare dashboard or wrangler secret:
 # NEON_DATABASE_URL
+# CONTROL_PLANE_BASIC_AUTH
