@@ -2452,12 +2452,50 @@ export class DeviceSession {
         order by created_at asc
       ` as AppApiKeyRecord[];
       const grants = await Promise.all((await this.hostedAppGrants(app.id)).map((grant) => this.grantView(grant)));
+      const recent_messages = await sql`
+        select
+          messages.id,
+          messages.id as message_id,
+          messages.workspace_id,
+          messages.app_id,
+          apps.name as app_name,
+          messages.device_id,
+          devices.name as device_name,
+          messages.channel,
+          messages.status,
+          messages.created_at,
+          messages.updated_at,
+          messages.expires_at,
+          messages.ciphertext,
+          messages.crypto
+        from messages
+        left join apps on apps.id = messages.app_id
+        left join devices on devices.id = messages.device_id
+        where messages.app_id = ${app.id}
+        order by messages.created_at desc, messages.id desc
+        limit 20
+      ` as any[];
       return Response.json({
         app: await this.hostedAppView(app),
         active_key,
         api_keys,
         grants,
-        recent_messages: [],
+        recent_messages: recent_messages.map((row) => ({
+          id: row.id,
+          message_id: row.message_id,
+          workspace_id: row.workspace_id,
+          app_id: row.app_id,
+          app_name: row.app_name,
+          device_id: row.device_id,
+          device_name: row.device_name,
+          channel: row.channel,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          expires_at: row.expires_at,
+          duration_ms: null,
+          crypto: messageCryptoView(row),
+        })),
         recent_audit_events: (await sql`
           select *
           from audit_events
@@ -2504,6 +2542,29 @@ export class DeviceSession {
         order by created_at desc
         limit 1
       ` as DeviceKeyRecord[])[0];
+      const recent_messages = await sql`
+        select
+          messages.id,
+          messages.id as message_id,
+          messages.workspace_id,
+          messages.app_id,
+          apps.name as app_name,
+          messages.device_id,
+          devices.name as device_name,
+          messages.channel,
+          messages.status,
+          messages.created_at,
+          messages.updated_at,
+          messages.expires_at,
+          messages.ciphertext,
+          messages.crypto
+        from messages
+        left join apps on apps.id = messages.app_id
+        left join devices on devices.id = messages.device_id
+        where messages.device_id = ${device.id}
+        order by messages.created_at desc, messages.id desc
+        limit 20
+      ` as any[];
       return Response.json({
         device: { ...device, status: device.status === "revoked" ? "revoked" : status },
         active_key,
@@ -2514,7 +2575,22 @@ export class DeviceSession {
           order by reported_at desc
         `,
         grants: await Promise.all((await this.hostedDeviceGrants(device.id)).map((grant) => this.grantView(grant))),
-        recent_messages: [],
+        recent_messages: recent_messages.map((row) => ({
+          id: row.id,
+          message_id: row.message_id,
+          workspace_id: row.workspace_id,
+          app_id: row.app_id,
+          app_name: row.app_name,
+          device_id: row.device_id,
+          device_name: row.device_name,
+          channel: row.channel,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          expires_at: row.expires_at,
+          duration_ms: null,
+          crypto: messageCryptoView(row),
+        })),
         recent_audit_events: await sql`
           select *
           from audit_events
