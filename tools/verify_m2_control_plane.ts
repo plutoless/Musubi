@@ -2,15 +2,13 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { startRelay } from "../apps/relay-server/src/main.ts";
 
-const port = String(32000 + Math.floor(Math.random() * 1000));
-const serverUrl = `http://127.0.0.1:${port}`;
 const home = `${process.cwd()}/.musubi/m2-control-plane`;
 const workspaceId = "ws_local";
 const prompt = "M2_CONTROL_PLANE_SECRET_PROMPT";
 
 await rm(home, { recursive: true, force: true });
 await assertM2Artifacts();
-const server = startRelay({ hostname: "127.0.0.1", port: Number(port) });
+const { server, serverUrl } = startAvailableRelay();
 let device: ReturnType<typeof spawn> | undefined;
 
 try {
@@ -135,6 +133,24 @@ try {
 
 console.log("[m2-control-plane] ok: local control plane APIs, UI route, grant flow, timeline, audit privacy, and revokes verified");
 process.exit(0);
+
+function startAvailableRelay() {
+  const firstPort = 30000 + Math.floor(Math.random() * 500);
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const port = firstPort + attempt;
+    try {
+      return {
+        server: startRelay({ hostname: "127.0.0.1", port }),
+        serverUrl: `http://127.0.0.1:${port}`,
+      };
+    } catch (error) {
+      if ((error as { code?: string }).code !== "EADDRINUSE" && !String(error).includes("EADDRINUSE")) {
+        throw error;
+      }
+    }
+  }
+  throw new Error("could not find an available local relay port");
+}
 
 async function assertM2Artifacts() {
   const productContract = await Bun.file("docs/control_plane_m2.md").text();
