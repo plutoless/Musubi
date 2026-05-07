@@ -548,7 +548,40 @@ export class DeviceSession {
     ` as any[];
     const type = url.searchParams.get("type");
     if (type) rows = rows.filter((row) => row.type === type);
-    const apps = await Promise.all(rows.map(async (row) => this.hostedAppView(row)));
+    const appIds = rows.map((row) => row.id).filter(Boolean);
+    if (appIds.length === 0) return Response.json({ apps: [], next_cursor: null });
+
+    const publisherIds = [...new Set(rows.map((row) => row.publisher_id).filter(Boolean))] as string[];
+    const [publishers, declarations, grants] = await Promise.all([
+      publisherIds.length
+        ? sql`select * from publisher_profiles where id = any(${publisherIds}::text[])` as Promise<PublisherRecord[]>
+        : Promise.resolve([]),
+      sql`
+        select *
+        from app_permission_declarations
+        where app_id = any(${appIds}::text[])
+        order by created_at asc
+      ` as Promise<PermissionDeclarationRecord[]>,
+      sql`
+        select *
+        from app_device_channel_grants
+        where app_id = any(${appIds}::text[])
+        order by created_at desc
+      ` as Promise<GrantRecord[]>,
+    ]);
+    const publishersById = new Map(publishers.map((publisher) => [publisher.id, publisher]));
+    const declarationsByAppId = groupBy(declarations, (declaration) => declaration.app_id);
+    const grantsByAppId = groupBy(grants, (grant) => grant.app_id);
+    const apps = rows.map((app) => {
+      const activeGrants = (grantsByAppId.get(app.id) ?? []).filter((grant) => !grant.revoked_at);
+      return {
+        ...app,
+        publisher: app.publisher_id ? publishersById.get(app.publisher_id) : undefined,
+        permission_declarations: declarationsByAppId.get(app.id) ?? [],
+        authorized_device_count: new Set(activeGrants.map((grant) => grant.device_id)).size,
+        allowed_channel_count: new Set(activeGrants.flatMap((grant) => grant.allowed_channels ?? [])).size,
+      };
+    });
     return Response.json({ apps, next_cursor: null });
   }
 

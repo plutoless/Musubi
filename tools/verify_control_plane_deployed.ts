@@ -38,7 +38,20 @@ if (!css.includes(".shell") || !css.includes(".sidebar")) {
   throw new Error("control plane styles.css did not include expected layout styles");
 }
 
-console.log("[control-plane-deployed] ok: deployed control plane is protected and static assets load");
+for (const path of [
+  "/v1/devices",
+  "/v1/apps",
+  "/v1/messages",
+  "/v1/audit-events",
+  "/v1/device-plugin-capabilities",
+  "/v1/authorized-apps",
+  "/v1/plugins",
+  "/v1/workspace/plugin-policy",
+]) {
+  await json(`${serverUrl}${path}`, headers);
+}
+
+console.log("[control-plane-deployed] ok: deployed control plane is protected, static assets load, and startup APIs respond");
 process.exit(0);
 
 async function text(url: string, headers: Record<string, string>) {
@@ -48,4 +61,17 @@ async function text(url: string, headers: Record<string, string>) {
     throw new Error(`${url} failed with HTTP ${response.status}: ${body.slice(0, 200)}`);
   }
   return body;
+}
+
+async function json(url: string, headers: Record<string, string>) {
+  const response = await fetch(url, { headers });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`${url} failed with HTTP ${response.status}: ${body.slice(0, 200)}`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error(`${url} did not return JSON: ${body.slice(0, 200)}`);
+  }
 }
