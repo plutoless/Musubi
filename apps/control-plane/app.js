@@ -23,14 +23,17 @@ async function load() {
   markActive();
   root.innerHTML = `<div class="panel loading-state">Loading...</div>`;
   try {
-    const [devices, apps, messages, audit, capabilities] = await Promise.all([
+    const [devices, apps, messages, audit, capabilities, authorizedApps, plugins, pluginPolicy] = await Promise.all([
       api("/v1/devices"),
       api("/v1/apps"),
       api("/v1/messages"),
       api("/v1/audit-events"),
       api("/v1/device-plugin-capabilities"),
+      api("/v1/authorized-apps"),
+      api("/v1/plugins"),
+      api("/v1/workspace/plugin-policy"),
     ]);
-    state.data = { devices, apps, messages, audit, capabilities };
+    state.data = { devices, apps, messages, audit, capabilities, authorizedApps, plugins, pluginPolicy };
     render();
   } catch (error) {
     root.innerHTML = `<div class="panel error-state">Control plane data failed to load: ${escapeHtml(error.message)}</div>`;
@@ -50,11 +53,16 @@ async function api(path, options) {
 function render() {
   const [name, id] = state.route.split("/");
   if (state.route === "apps/new") return renderNewApp();
+  if (state.route === "apps/authorized") return renderAuthorizedApps();
+  if (name === "consent" && id) return renderConsent(id);
+  if (name === "plugins" && id) return renderPlugin(id);
   if (name === "devices" && id) return renderDevice(id);
   if (name === "apps" && id) return renderApp(id);
   if (name === "messages" && id) return renderMessage(id);
   if (name === "devices") return renderDevices();
   if (name === "apps") return renderApps();
+  if (name === "developer") return renderDeveloper();
+  if (name === "plugins") return renderPlugins();
   if (name === "messages") return renderMessages();
   if (name === "audit") return renderAudit();
   if (name === "settings") return renderSettings();
@@ -205,6 +213,172 @@ function renderNewApp() {
             ${kvItem("MUSUBI_API_KEY", "printed once")}
             ${kvItem("MUSUBI_APP_PRIVATE_KEY", "stored locally")}
           </div>
+        `)}
+      </aside>
+    </section>
+  `;
+  bindCopy();
+}
+
+function renderDeveloper() {
+  setHeader("Developer", "Register third-party apps and declare the plugin channels they request.");
+  const server = location.origin;
+  const snippet = `# Create a developer profile and publisher
+curl -X POST ${server}/v1/developers -H 'Content-Type: application/json' \\
+  --data '{"name":"Local Developer","email":"dev@example.test"}'
+
+curl -X POST ${server}/v1/publishers -H 'Content-Type: application/json' \\
+  --data '{"developer_id":"devacct_001","display_name":"Example Tools","website":"https://example.test"}'
+
+# Register a third-party app, then declare plugin channels
+curl -X POST ${server}/v1/developer/apps -H 'Content-Type: application/json' \\
+  --data '{"workspace_id":"ws_local","name":"Example Third-party App","type":"third_party","publisher_id":"pub_001","public_key":"BASE64_X25519_PUBLIC_KEY"}'
+
+curl -X POST ${server}/v1/developer/apps/app_001/permission-declarations -H 'Content-Type: application/json' \\
+  --data '{"plugin_name":"codex","channels":["codex.task.create"],"reason":"Create approved local coding tasks"}'`;
+  root.innerHTML = `
+    <section class="detail-layout">
+      <div class="detail-main">
+        ${panel("Third-party App Registration", `
+          <p class="notice inline">Third-party apps must identify their publisher and declare requested plugin channels before a user can consent.</p>
+          <pre>${escapeHtml(snippet)}</pre>
+          <button data-copy="${escapeHtml(snippet)}">Copy developer flow</button>
+        `)}
+        ${panel("Registered Apps", appTable(state.data.apps.apps), "table-panel")}
+      </div>
+      <aside class="detail-rail">
+        ${panel("Consent Request", `
+          <p class="muted">After an app declares channels, create a consent request and send the user to <span class="mono">#consent/{id}</span>.</p>
+          <div class="rail-kv">
+            ${kvItem("Encryption", "Payload encrypted end-to-end")}
+            ${kvItem("Local policy", "Device remains final authority")}
+            ${kvItem("Revoke", "User can revoke grants any time")}
+          </div>
+        `)}
+      </aside>
+    </section>
+  `;
+  bindCopy();
+}
+
+async function renderConsent(id) {
+  setHeader("Consent", "Review app identity, publisher, requested permissions, and local device scope.");
+  const detail = await api(`/v1/consent-requests/${id}`);
+  const app = detail.app;
+  const request = detail.consent_request;
+  const devices = detail.devices || [];
+  const requestedChannels = request.requested_capabilities.flatMap((capability) => capability.channels);
+  root.innerHTML = `
+    <section class="detail-layout">
+      <div class="detail-main">
+        ${panel("", `
+          ${entityHeader(app.name, "Third-party app consent", badge(request.status))}
+          <div class="kv-grid">
+            ${kvItem("App ID", app.id)}
+            ${kvItem("Publisher", app.publisher?.display_name || "Unverified publisher")}
+            ${kvItem("Trust status", app.trust_status || "unverified")}
+            ${kvItem("Review status", app.review_status || "not submitted")}
+          </div>
+          <p class="notice inline">Payload encrypted end-to-end. Musubi routes requests but cannot read task contents; local policy on the selected device can still deny execution.</p>
+        `)}
+        ${panel("Requested Access", `
+          <div class="permission-grid">
+            ${request.requested_capabilities.map((capability) => `
+              <div class="band">
+                <h3>${escapeHtml(capability.plugin)}</h3>
+                <div class="chips">${chips(capability.channels)}</div>
+                <p class="muted">${escapeHtml(capability.reason || "No reason provided.")}</p>
+              </div>
+            `).join("")}
+          </div>
+        `)}
+      </div>
+      <aside class="detail-rail">
+        ${panel("Approve Scope", `
+          <div class="form-grid">
+            <label>Device<select id="consent-device">${devices.map((device) => `<option value="${device.id}">${escapeHtml(device.name || device.id)} (${device.status})</option>`).join("")}</select></label>
+            <div class="channel-editor">
+              <h3>Channels</h3>
+              <div class="checkboxes">
+                ${requestedChannels.map((channel) => `<label><input type="checkbox" value="${escapeHtml(channel)}" checked /> ${escapeHtml(channel)}</label>`).join("")}
+              </div>
+            </div>
+            <label class="toggle-line"><input id="consent-queueing" type="checkbox" /> Queue when device is offline</label>
+            <button class="primary" id="approve-consent" ${request.status === "pending" ? "" : "disabled"}>Approve grant</button>
+          </div>
+          <p class="muted">You can revoke this app or individual grants from Authorized Apps after approval.</p>
+        `, "permission-panel")}
+      </aside>
+    </section>
+  `;
+  document.querySelector("#approve-consent")?.addEventListener("click", async () => {
+    const allowed_channels = [...document.querySelectorAll(".checkboxes input:checked")].map((input) => input.value);
+    await api(`/v1/consent-requests/${id}/approve`, {
+      method: "POST",
+      body: JSON.stringify({
+        device_id: document.querySelector("#consent-device").value,
+        allowed_channels,
+        queueing_allowed: document.querySelector("#consent-queueing").checked,
+      }),
+    });
+    location.hash = "apps/authorized";
+    load();
+  });
+}
+
+function renderAuthorizedApps() {
+  setHeader("Authorized Apps", "Third-party app grants, publisher identity, reports, and revoke controls.");
+  const rows = state.data.authorizedApps.authorized_apps || [];
+  root.innerHTML = `
+    <section class="notice">Authorized app grants can be revoked without deleting message or audit history.</section>
+    ${panel("Third-party Apps", authorizedAppTable(rows), "table-panel")}
+  `;
+  bindActions();
+}
+
+function renderPlugins() {
+  setHeader("Plugins", "Registry packages, signatures, trust level, and workspace install policy.");
+  const plugins = state.data.plugins.plugins || [];
+  const policy = state.data.pluginPolicy.policy;
+  root.innerHTML = `
+    <section class="metric-strip compact">
+      ${metric("Registry plugins", plugins.length, "Available locally")}
+      ${metric("Signature required", policy.require_signature ? "yes" : "no", "Default install gate")}
+      ${metric("Allowed trust", policy.allowed_trust_levels.join(", "), "Workspace policy")}
+      ${metric("Blocked plugins", policy.blocked_plugins.length, "Explicit denials")}
+    </section>
+    ${panel("Registry", pluginTable(plugins), "table-panel")}
+  `;
+}
+
+async function renderPlugin(name) {
+  setHeader("Plugin Detail", "Inspect manifest, publisher trust, signature metadata, and install command.");
+  const detail = await api(`/v1/plugins/${name}`);
+  const plugin = detail.plugin;
+  const installCommand = `go run ./cmd/musubi plugin install ${plugin.name} --server ${location.origin} --home .musubi/m4 --version ${plugin.version} --yes`;
+  root.innerHTML = `
+    <section class="detail-layout">
+      <div class="detail-main">
+        ${panel("", `
+          ${entityHeader(plugin.name, "Registry plugin", badge(plugin.signature_status))}
+          <div class="kv-grid">
+            ${kvItem("Version", plugin.version)}
+            ${kvItem("Publisher", `${plugin.publisher.name} (${plugin.publisher.trust})`)}
+            ${kvItem("Digest", plugin.package_digest)}
+            ${kvItem("Signing key", plugin.signing_key_id)}
+          </div>
+        `)}
+        ${panel("Manifest", `
+          <div class="permission-grid">
+            <div><span class="muted">Channels</span><div class="chips">${chips(plugin.manifest.channels)}</div></div>
+            <div><span class="muted">Permissions</span><div class="chips">${chips(plugin.manifest.permissions)}</div></div>
+          </div>
+        `)}
+      </div>
+      <aside class="detail-rail">
+        ${panel("Install", `
+          <pre>${escapeHtml(installCommand)}</pre>
+          <button data-copy="${escapeHtml(installCommand)}">Copy install command</button>
         `)}
       </aside>
     </section>
@@ -413,14 +587,40 @@ function deviceTable(devices) {
 
 function appTable(apps) {
   if (!apps.length) return empty("No apps created yet.");
-  return table(["App", "Type", "Status", "Authorized Devices", "Allowed Channels", "Created At", "Actions"], apps.map((app) => [
+  return table(["App", "Type", "Trust", "Status", "Authorized Devices", "Allowed Channels", "Created At", "Actions"], apps.map((app) => [
     resourceCell(app.name, app.id),
     escapeHtml(app.type),
+    badge(app.trust_status || app.publisher?.verification_status || "local"),
     badge(app.status),
     mono(String(app.authorized_device_count)),
     mono(String(app.allowed_channel_count)),
     timeCell(app.created_at),
     `<button onclick="location.hash='apps/${app.id}'">View detail</button>`,
+  ]));
+}
+
+function authorizedAppTable(rows) {
+  if (!rows.length) return empty("No third-party apps are authorized yet.");
+  return table(["App", "Publisher", "Trust", "Grants", "Reports", "Actions"], rows.map((row) => [
+    resourceCell(row.app.name, row.app.id),
+    escapeHtml(row.app.publisher?.display_name || "Unverified publisher"),
+    badge(row.app.trust_status || "unverified"),
+    mono(String(row.grants.filter((grant) => grant.status === "active").length)),
+    mono(String(row.reports.length)),
+    `<div class="toolbar table-actions"><button onclick="location.hash='apps/${row.app.id}'">View</button><button data-report-app="${row.app.id}">Report</button><button class="danger" data-revoke-app="${row.app.id}">Revoke</button></div>`,
+  ]));
+}
+
+function pluginTable(plugins) {
+  if (!plugins.length) return empty("No registry plugins available.");
+  return table(["Plugin", "Publisher", "Trust", "Signature", "Channels", "Permissions", "Actions"], plugins.map((plugin) => [
+    resourceCell(plugin.name, plugin.version),
+    escapeHtml(plugin.publisher?.name || "unknown"),
+    badge(plugin.publisher?.trust || "unknown"),
+    badge(plugin.signature_status),
+    chips(plugin.manifest?.channels || []),
+    chips(plugin.manifest?.permissions || []),
+    `<button onclick="location.hash='plugins/${plugin.name}'">View detail</button>`,
   ]));
 }
 
@@ -555,16 +755,23 @@ function unique(values) {
 }
 
 function capabilityCard(capability) {
+  const manifest = capability.manifest || {};
   return `
     <div class="band capability-card">
       <div class="capability-head">
         <h3>${escapeHtml(capability.plugin_name)}</h3>
         <span>${escapeHtml(capability.plugin_version)}</span>
       </div>
+      <div class="toolbar">
+        ${badge(manifest.trust_level || "local")}
+        ${badge(manifest.signature_status || "unreported")}
+        ${manifest.install_source ? `<span class="chip">${escapeHtml(manifest.install_source)}</span>` : ""}
+      </div>
       <div class="permission-grid">
         <div><span class="muted">Channels</span><div class="chips">${chips(capability.channels)}</div></div>
         <div><span class="muted">Requested permissions</span><div class="chips">${chips(capability.permissions)}</div></div>
       </div>
+      ${manifest.publisher_name ? `<p class="muted">Publisher: ${escapeHtml(manifest.publisher_name)}</p>` : ""}
       <p class="muted">Last reported: ${fmt(capability.reported_at)}</p>
     </div>
   `;
@@ -629,6 +836,15 @@ function bindActions() {
       const appId = state.route.split("/")[1];
       await api(`/v1/apps/${appId}/api-keys/${button.dataset.revokeApiKey}/revoke`, { method: "POST" });
       state.createdApiKey = null;
+      load();
+    });
+  });
+  document.querySelectorAll("[data-report-app]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await api(`/v1/apps/${button.dataset.reportApp}/report`, {
+        method: "POST",
+        body: JSON.stringify({ reason: "user_reported", description: "Reported from local control plane" }),
+      });
       load();
     });
   });

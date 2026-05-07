@@ -11,6 +11,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -189,6 +190,64 @@ type pluginManifest struct {
 	Entry       string   `json:"entry"`
 	Channels    []string `json:"channels"`
 	Permissions []string `json:"permissions"`
+	Publisher   struct {
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Trust string `json:"trust"`
+	} `json:"publisher"`
+	EventChannels []string               `json:"event_channels"`
+	ConfigSchema  map[string]interface{} `json:"config_schema"`
+}
+
+type workspacePluginPolicy struct {
+	RequireSignature                     bool     `json:"require_signature"`
+	AllowedTrustLevels                   []string `json:"allowed_trust_levels"`
+	AllowedPlugins                       []string `json:"allowed_plugins"`
+	BlockedPlugins                       []string `json:"blocked_plugins"`
+	RequireApprovalForPermissionIncrease bool     `json:"require_approval_for_permission_increase"`
+}
+
+type workspacePluginPolicyResponse struct {
+	Policy workspacePluginPolicy `json:"policy"`
+}
+
+type registryPluginResponse struct {
+	Plugin registryPluginPackage `json:"plugin"`
+}
+
+type registryPluginPackage struct {
+	Name             string          `json:"name"`
+	Version          string          `json:"version"`
+	Publisher        pluginPublisher `json:"publisher"`
+	Manifest         pluginManifest  `json:"manifest"`
+	PackageURL       string          `json:"package_url"`
+	PackageDigest    string          `json:"package_digest"`
+	SignedPayload    string          `json:"signed_payload"`
+	Signature        string          `json:"signature"`
+	SigningKeyID     string          `json:"signing_key_id"`
+	SigningPublicKey string          `json:"signing_public_key"`
+	SignatureStatus  string          `json:"signature_status"`
+}
+
+type pluginPublisher struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Trust string `json:"trust"`
+}
+
+type pluginInstallRecord struct {
+	Name            string   `json:"name"`
+	Version         string   `json:"version"`
+	PublisherID     string   `json:"publisher_id"`
+	PublisherName   string   `json:"publisher_name"`
+	TrustLevel      string   `json:"trust_level"`
+	SignatureStatus string   `json:"signature_status"`
+	SigningKeyID    string   `json:"signing_key_id"`
+	InstallSource   string   `json:"install_source"`
+	Channels        []string `json:"channels"`
+	Permissions     []string `json:"permissions"`
+	PackageDigest   string   `json:"package_digest"`
+	InstalledAt     string   `json:"installed_at"`
 }
 
 type localPolicy struct {
@@ -802,20 +861,30 @@ func reportPluginCapabilities(config deviceConfig) error {
 		if err != nil {
 			return err
 		}
+		manifestView := map[string]interface{}{
+			"name":        manifest.Name,
+			"version":     manifest.Version,
+			"description": manifest.Description,
+			"runtime":     manifest.Runtime,
+			"entry":       manifest.Entry,
+			"channels":    manifest.Channels,
+			"permissions": manifest.Permissions,
+		}
+		if installed, err := readPluginInstallRecord(activeMusubiHome, name); err == nil {
+			manifestView["publisher_id"] = installed.PublisherID
+			manifestView["publisher_name"] = installed.PublisherName
+			manifestView["trust_level"] = installed.TrustLevel
+			manifestView["signature_status"] = installed.SignatureStatus
+			manifestView["signing_key_id"] = installed.SigningKeyID
+			manifestView["install_source"] = installed.InstallSource
+			manifestView["package_digest"] = installed.PackageDigest
+		}
 		plugins = append(plugins, map[string]interface{}{
 			"name":        manifest.Name,
 			"version":     manifest.Version,
 			"channels":    manifest.Channels,
 			"permissions": manifest.Permissions,
-			"manifest": map[string]interface{}{
-				"name":        manifest.Name,
-				"version":     manifest.Version,
-				"description": manifest.Description,
-				"runtime":     manifest.Runtime,
-				"entry":       manifest.Entry,
-				"channels":    manifest.Channels,
-				"permissions": manifest.Permissions,
-			},
+			"manifest":    manifestView,
 		})
 	}
 	body, err := json.Marshal(map[string]interface{}{"plugins": plugins})
@@ -1314,13 +1383,29 @@ func hostname() string {
 }
 
 func runPluginCLI(args []string) error {
-	if len(args) < 2 || args[0] != "run" {
+	if len(args) < 1 {
+		return errors.New("usage: musubi plugin <run|install|update-check> ...")
+	}
+	switch args[0] {
+	case "run":
+		return runPluginRunCLI(args[1:])
+	case "install":
+		return runPluginInstallCLI(args[1:])
+	case "update-check":
+		return runPluginUpdateCheckCLI(args[1:])
+	default:
+		return errors.New("usage: musubi plugin <run|install|update-check> ...")
+	}
+}
+
+func runPluginRunCLI(args []string) error {
+	if len(args) < 1 {
 		return errors.New("usage: musubi plugin run <name> --payload <path>")
 	}
-	name := args[1]
+	name := args[0]
 	flags := flag.NewFlagSet("plugin run", flag.ContinueOnError)
 	payloadPath := flags.String("payload", "", "payload JSON file")
-	if err := flags.Parse(args[2:]); err != nil {
+	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *payloadPath == "" {
@@ -1377,6 +1462,217 @@ func runPluginCLI(args []string) error {
 	log.Printf("[musubi] plugin lifecycle completed name=%s channel=%s", manifest.Name, channel)
 	fmt.Println(string(result))
 	return nil
+}
+
+func runPluginInstallCLI(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: musubi plugin install <name> --server <url> [--home <path>] [--version latest] [--yes]")
+	}
+	name := args[0]
+	flags := flag.NewFlagSet("plugin install", flag.ContinueOnError)
+	serverURL := flags.String("server", "http://127.0.0.1:8787", "Musubi server URL")
+	home := flags.String("home", defaultMusubiHome(), "Musubi home directory")
+	version := flags.String("version", "latest", "plugin version")
+	yes := flags.Bool("yes", false, "accept permission review")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	var policyResponse workspacePluginPolicyResponse
+	if err := getJSON(strings.TrimRight(*serverURL, "/")+"/v1/workspace/plugin-policy", &policyResponse); err != nil {
+		return err
+	}
+	var registryResponse registryPluginResponse
+	if err := getJSON(strings.TrimRight(*serverURL, "/")+"/v1/plugin-registry/resolve?name="+url.QueryEscape(name)+"&version="+url.QueryEscape(*version), &registryResponse); err != nil {
+		return err
+	}
+	plugin := registryResponse.Plugin
+	if err := enforcePluginPolicy(policyResponse.Policy, plugin); err != nil {
+		return err
+	}
+	if err := verifyRegistryPlugin(plugin); err != nil {
+		return err
+	}
+
+	fmt.Printf("Plugin: %s\n", plugin.Name)
+	fmt.Printf("Publisher: %s (%s)\n", plugin.Publisher.Name, plugin.Publisher.Trust)
+	fmt.Printf("Version: %s\n", plugin.Version)
+	fmt.Printf("Signature: %s\n", plugin.SignatureStatus)
+	fmt.Printf("Channels: %s\n", strings.Join(plugin.Manifest.Channels, ", "))
+	fmt.Printf("Requested permissions: %s\n", strings.Join(plugin.Manifest.Permissions, ", "))
+	if !*yes {
+		return errors.New("install requires --yes after reviewing permissions")
+	}
+
+	record := pluginInstallRecord{
+		Name:            plugin.Name,
+		Version:         plugin.Version,
+		PublisherID:     plugin.Publisher.ID,
+		PublisherName:   plugin.Publisher.Name,
+		TrustLevel:      plugin.Publisher.Trust,
+		SignatureStatus: plugin.SignatureStatus,
+		SigningKeyID:    plugin.SigningKeyID,
+		InstallSource:   "registry",
+		Channels:        plugin.Manifest.Channels,
+		Permissions:     plugin.Manifest.Permissions,
+		PackageDigest:   plugin.PackageDigest,
+		InstalledAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := writePluginInstallRecord(*home, record); err != nil {
+		return err
+	}
+	_ = reportInstalledPlugin(*serverURL, *home, record)
+	fmt.Println("Install approved")
+	fmt.Printf("installed %s@%s\n", record.Name, record.Version)
+	return nil
+}
+
+func runPluginUpdateCheckCLI(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: musubi plugin update-check <name> --server <url> [--home <path>]")
+	}
+	name := args[0]
+	flags := flag.NewFlagSet("plugin update-check", flag.ContinueOnError)
+	serverURL := flags.String("server", "http://127.0.0.1:8787", "Musubi server URL")
+	home := flags.String("home", defaultMusubiHome(), "Musubi home directory")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	installed, err := readPluginInstallRecord(*home, name)
+	if err != nil {
+		return err
+	}
+	var registryResponse registryPluginResponse
+	if err := getJSON(strings.TrimRight(*serverURL, "/")+"/v1/plugin-registry/resolve?name="+url.QueryEscape(name)+"&version=latest", &registryResponse); err != nil {
+		return err
+	}
+	latest := registryResponse.Plugin
+	fmt.Printf("%s %s -> %s\n", name, installed.Version, latest.Version)
+	newPermissions := difference(latest.Manifest.Permissions, installed.Permissions)
+	newChannels := difference(latest.Manifest.Channels, installed.Channels)
+	if len(newPermissions) == 0 && len(newChannels) == 0 {
+		fmt.Println("No permission increase")
+		return nil
+	}
+	if len(newPermissions) > 0 {
+		fmt.Printf("New permissions: %s\n", strings.Join(newPermissions, ", "))
+	}
+	if len(newChannels) > 0 {
+		fmt.Printf("New channels: %s\n", strings.Join(newChannels, ", "))
+	}
+	return nil
+}
+
+func enforcePluginPolicy(policy workspacePluginPolicy, plugin registryPluginPackage) error {
+	if contains(policy.BlockedPlugins, plugin.Name) {
+		return fmt.Errorf("workspace plugin policy blocked %s", plugin.Name)
+	}
+	if len(policy.AllowedPlugins) > 0 && !contains(policy.AllowedPlugins, plugin.Name) {
+		return fmt.Errorf("workspace plugin policy does not allow %s", plugin.Name)
+	}
+	if len(policy.AllowedTrustLevels) > 0 && !contains(policy.AllowedTrustLevels, plugin.Publisher.Trust) {
+		return fmt.Errorf("workspace plugin policy requires trusted publisher; got %s", plugin.Publisher.Trust)
+	}
+	if policy.RequireSignature && (plugin.Signature == "" || plugin.SignatureStatus == "unsigned") {
+		return errors.New("unsigned plugin blocked by workspace policy")
+	}
+	return nil
+}
+
+func verifyRegistryPlugin(plugin registryPluginPackage) error {
+	sum := sha256.Sum256([]byte(plugin.SignedPayload))
+	if plugin.PackageDigest != "sha256:"+fmt.Sprintf("%x", sum[:]) {
+		return errors.New("package digest verification failed")
+	}
+	if plugin.Signature == "" {
+		return errors.New("unsigned plugin blocked by default")
+	}
+	keyDer, err := base64.StdEncoding.DecodeString(plugin.SigningPublicKey)
+	if err != nil {
+		return err
+	}
+	publicKey, err := x509.ParsePKIXPublicKey(keyDer)
+	if err != nil {
+		return err
+	}
+	edKey, ok := publicKey.(ed25519.PublicKey)
+	if !ok {
+		return errors.New("plugin signing key is not Ed25519")
+	}
+	signature, err := base64.StdEncoding.DecodeString(plugin.Signature)
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(edKey, []byte(plugin.SignedPayload), signature) {
+		return errors.New("signature verification failed")
+	}
+	if plugin.SignatureStatus != "verified" {
+		return fmt.Errorf("signature status is %s", plugin.SignatureStatus)
+	}
+	return nil
+}
+
+func getJSON(url string, response interface{}) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("get %s failed: %s %s", url, resp.Status, string(responseBody))
+	}
+	return json.NewDecoder(resp.Body).Decode(response)
+}
+
+func pluginInstallPath(home string, name string) string {
+	if home == "" {
+		home = defaultMusubiHome()
+	}
+	return filepath.Join(home, "plugins", name+".install.json")
+}
+
+func writePluginInstallRecord(home string, record pluginInstallRecord) error {
+	dir := filepath.Join(home, "plugins")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	bytes, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(pluginInstallPath(home, record.Name), bytes, 0600)
+}
+
+func readPluginInstallRecord(home string, name string) (pluginInstallRecord, error) {
+	bytes, err := os.ReadFile(pluginInstallPath(home, name))
+	if err != nil {
+		return pluginInstallRecord{}, err
+	}
+	var record pluginInstallRecord
+	if err := json.Unmarshal(bytes, &record); err != nil {
+		return pluginInstallRecord{}, err
+	}
+	return record, nil
+}
+
+func reportInstalledPlugin(serverURL string, home string, record pluginInstallRecord) error {
+	config, err := readDeviceConfig(home)
+	if err != nil {
+		return nil
+	}
+	return postJSON(strings.TrimRight(serverURL, "/")+"/v1/devices/"+config.DeviceID+"/plugins/report", map[string]interface{}{
+		"plugins": []pluginInstallRecord{record},
+	}, nil)
+}
+
+func difference(next []string, current []string) []string {
+	out := []string{}
+	for _, value := range next {
+		if !contains(current, value) {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func loadPluginManifest(name string) (pluginManifest, error) {

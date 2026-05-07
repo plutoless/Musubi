@@ -7,7 +7,7 @@ import {
   allowedChannels,
   visibleEnvelopeLog,
 } from "../../../packages/protocol/src/index.ts";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
 
 type DeviceSocket = ServerWebSocket<{ deviceId: string }>;
 
@@ -54,9 +54,16 @@ interface AppRecord {
   workspace_id: string;
   name: string;
   description?: string;
-  type: "first_party" | "user_owned";
-  status: "active" | "revoked";
+  type: "first_party" | "user_owned" | "third_party";
+  status: "draft" | "active" | "disabled" | "revoked" | "suspended";
+  publisher_id?: string;
+  website?: string;
+  privacy_policy_url?: string;
+  terms_url?: string;
+  trust_status?: "unverified" | "verified" | "official" | "suspicious" | "blocked";
+  review_status?: "not_submitted" | "in_review" | "approved" | "rejected" | "changes_requested";
   created_at: string;
+  updated_at?: string;
   disabled_at?: string;
   disabled_by?: string;
   revoked_at?: string;
@@ -137,6 +144,87 @@ interface MessageStatusEventRecord {
   created_at: string;
 }
 
+interface DeveloperRecord {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  email?: string;
+  status: "active" | "suspended";
+  created_at: string;
+  verified_at?: string;
+  suspended_at?: string;
+}
+
+interface PublisherRecord {
+  id: string;
+  developer_id: string;
+  display_name: string;
+  website?: string;
+  support_email?: string;
+  privacy_policy_url?: string;
+  terms_url?: string;
+  logo_url?: string;
+  verification_status: "unverified" | "verified" | "suspended";
+  created_at: string;
+  updated_at?: string;
+}
+
+interface PermissionDeclarationRecord {
+  id: string;
+  app_id: string;
+  plugin_name: string;
+  channels: string[];
+  reason?: string;
+  queueing_requested: boolean;
+  created_at: string;
+  updated_at?: string;
+}
+
+interface ConsentRequestRecord {
+  id: string;
+  app_id: string;
+  user_id?: string;
+  state?: string;
+  redirect_uri?: string;
+  requested_capabilities: Array<{ plugin: string; channels: string[]; reason?: string }>;
+  status: "pending" | "approved" | "cancelled" | "expired";
+  created_at: string;
+  completed_at?: string;
+  expires_at?: string;
+  grant_id?: string;
+}
+
+interface AppAbuseReportRecord {
+  id: string;
+  app_id: string;
+  reporter_user_id?: string;
+  reason: string;
+  description?: string;
+  status: "open" | "resolved";
+  created_at: string;
+  resolved_at?: string;
+}
+
+interface WorkspacePluginPolicyRecord {
+  require_signature: boolean;
+  allowed_trust_levels: string[];
+  allowed_plugins: string[];
+  blocked_plugins: string[];
+  require_approval_for_permission_increase: boolean;
+  updated_at?: string;
+}
+
+interface RegistryPluginVersion {
+  version: string;
+  manifest: Record<string, unknown>;
+  package_url: string;
+  package_digest: string;
+  signed_payload: string;
+  signature: string;
+  signing_key_id: string;
+  signature_status?: "verified" | "invalid" | "unsigned";
+}
+
 export function startRelay(options: { hostname?: string; port?: number } = {}) {
   const messages = new Map<string, StoredMessage>();
   const devices = new Map<string, DeviceRecord>();
@@ -146,8 +234,23 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
   const appApiKeys = new Map<string, AppApiKeyRecord>();
   const grants = new Map<string, GrantRecord>();
   const capabilities: DevicePluginCapabilityRecord[] = [];
+  const developers = new Map<string, DeveloperRecord>();
+  const publishers = new Map<string, PublisherRecord>();
+  const permissionDeclarations: PermissionDeclarationRecord[] = [];
+  const consentRequests = new Map<string, ConsentRequestRecord>();
+  const abuseReports: AppAbuseReportRecord[] = [];
+  const pluginInstallReports: DevicePluginCapabilityRecord[] = [];
   const auditEvents: AuditEventRecord[] = [];
   const messageStatusEvents: MessageStatusEventRecord[] = [];
+  const pluginSigningKey = generateKeyPairSync("ed25519");
+  const pluginSigningKeyId = "pluginkey_musubi_local";
+  const workspacePluginPolicy: WorkspacePluginPolicyRecord = {
+    require_signature: true,
+    allowed_trust_levels: ["official", "verified"],
+    allowed_plugins: ["echo", "hermes", "codex"],
+    blocked_plugins: [],
+    require_approval_for_permission_increase: true,
+  };
   let deviceSocket: DeviceSocket | undefined;
 
   function transition(messageId: string, status: MessageState, fields: { error_code?: string; error_message?: string } = {}) {
@@ -289,7 +392,9 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
 
   function grantDenied(workspaceId: string, appId: string, deviceId: string, channel: string): string | undefined {
     const app = apps.get(appId);
-    if (!app || app.status !== "active") return "app denied";
+    if (!app || app.status !== "active") return app?.status === "suspended" ? "app suspended" : "app denied";
+    if (app.trust_status === "blocked") return "app blocked";
+    if (app.type === "third_party" && !declaresChannel(app.id, channel)) return "undeclared channel denied";
     const device = devices.get(deviceId);
     if (!device) return "device denied";
     if (device.status === "revoked") return "device revoked";
@@ -318,6 +423,109 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         !grant.revoked_at &&
         grant.allowed_channels.includes(channel),
     );
+  }
+
+  function declaresChannel(appId: string, channel: string) {
+    const appDeclarations = permissionDeclarations.filter((declaration) => declaration.app_id === appId);
+    if (appDeclarations.length === 0) return false;
+    return appDeclarations.some((declaration) => declaration.channels.includes(channel));
+  }
+
+  function publisherView(publisherId?: string) {
+    return publisherId ? publishers.get(publisherId) : undefined;
+  }
+
+  function appView(app: AppRecord) {
+    const activeGrants = [...grants.values()].filter((grant) => grant.app_id === app.id && !grant.revoked_at);
+    return {
+      ...app,
+      publisher: publisherView(app.publisher_id),
+      permission_declarations: permissionDeclarations.filter((item) => item.app_id === app.id),
+      authorized_device_count: new Set(activeGrants.map((grant) => grant.device_id)).size,
+      allowed_channel_count: new Set(activeGrants.flatMap((grant) => grant.allowed_channels)).size,
+    };
+  }
+
+  function registryVersion(name: string, version = "latest"): RegistryPluginVersion | undefined {
+    const latestByName: Record<string, string> = { echo: "0.1.0", hermes: "0.1.0", codex: "0.3.0", "community-signed": "1.0.0", "community-unsigned": "1.0.0" };
+    const resolved = version === "latest" ? latestByName[name] : version;
+    const base: Record<string, RegistryPluginVersion | undefined> = {
+      "codex@0.2.5": signedPlugin("codex", "0.2.5", "official", ["codex.task.create", "codex.task.cancel", "codex.task.status"], ["process.spawn", "fs.read.project", "fs.write.project", "network.outbound"]),
+      "codex@0.3.0": signedPlugin("codex", "0.3.0", "official", ["codex.task.create", "codex.task.cancel", "codex.task.status"], ["process.spawn", "fs.read.project", "fs.write.project", "network.outbound", "fs.write.any"]),
+      "codex@tampered": signedPlugin("codex", "tampered", "official", ["codex.task.create"], ["process.spawn"], "invalid"),
+      "echo@0.1.0": signedPlugin("echo", "0.1.0", "official", ["echo.echo", "echo.ping"], ["status.report"]),
+      "hermes@0.1.0": signedPlugin("hermes", "0.1.0", "official", ["hermes.task.create", "hermes.task.cancel", "hermes.task.status"], ["process.spawn", "fs.read.project", "fs.write.project", "network.outbound"]),
+      "community-signed@1.0.0": signedPlugin("community-signed", "1.0.0", "community", ["community.run"], ["process.spawn"]),
+      "community-unsigned@1.0.0": unsignedPlugin("community-unsigned", "1.0.0", "community", ["community.run"], ["process.spawn.any"]),
+    };
+    return base[`${name}@${resolved}`];
+  }
+
+  function signedPlugin(name: string, version: string, trust: string, channels: string[], permissions: string[], signatureStatus: "verified" | "invalid" = "verified"): RegistryPluginVersion {
+    const manifest = pluginManifestV2(name, version, trust, channels, permissions);
+    const signedPayload = `${name}|${version}|${createHash("sha256").update(JSON.stringify(manifest)).digest("hex")}`;
+    const signature = sign(null, Buffer.from(signedPayload), pluginSigningKey.privateKey).toString("base64");
+    return {
+      version,
+      manifest,
+      package_url: `registry://plugins/${name}/${version}`,
+      package_digest: `sha256:${createHash("sha256").update(signedPayload).digest("hex")}`,
+      signed_payload: signedPayload,
+      signature: signatureStatus === "invalid" ? `${signature.slice(0, -2)}xx` : signature,
+      signing_key_id: pluginSigningKeyId,
+      signature_status: signatureStatus,
+    };
+  }
+
+  function unsignedPlugin(name: string, version: string, trust: string, channels: string[], permissions: string[]): RegistryPluginVersion {
+    const manifest = pluginManifestV2(name, version, trust, channels, permissions);
+    const signedPayload = `${name}|${version}|${createHash("sha256").update(JSON.stringify(manifest)).digest("hex")}`;
+    return {
+      version,
+      manifest,
+      package_url: `registry://plugins/${name}/${version}`,
+      package_digest: `sha256:${createHash("sha256").update(signedPayload).digest("hex")}`,
+      signed_payload: signedPayload,
+      signature: "",
+      signing_key_id: pluginSigningKeyId,
+      signature_status: "unsigned",
+    };
+  }
+
+  function pluginManifestV2(name: string, version: string, trust: string, channels: string[], permissions: string[]) {
+    return {
+      name,
+      version,
+      publisher: { id: trust === "official" ? "plugpub_musubi" : "plugpub_community", name: trust === "official" ? "Musubi" : "Community", trust },
+      description: `${name} plugin package`,
+      runtime: "bun",
+      entry: `bun run plugins/${name}/src/main.ts`,
+      channels,
+      event_channels: channels.some((channel) => channel.includes("codex")) ? ["codex.task.event"] : channels.some((channel) => channel.includes("hermes")) ? ["hermes.task.event"] : [],
+      permissions,
+      config_schema: {},
+    };
+  }
+
+  function registryPluginResponse(name: string, version = "latest") {
+    const resolved = registryVersion(name, version);
+    if (!resolved) return undefined;
+    const manifest = resolved.manifest as any;
+    return {
+      plugin: {
+        name,
+        version: resolved.version,
+        publisher: manifest.publisher,
+        manifest: resolved.manifest,
+        package_url: resolved.package_url,
+        package_digest: resolved.package_digest,
+        signed_payload: resolved.signed_payload,
+        signature: resolved.signature,
+        signing_key_id: resolved.signing_key_id,
+        signing_public_key: Buffer.from(pluginSigningKey.publicKey.export({ format: "der", type: "spki" }) as Buffer).toString("base64"),
+        signature_status: resolved.signature_status,
+      },
+    };
   }
 
   function isExpired(envelope: MessageEnvelope): boolean {
@@ -461,7 +669,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     const now = new Date().toISOString();
     const device: DeviceRecord = {
       id: deviceId,
-      workspace_id: body.workspace_id,
+      workspace_id: body.workspace_id ?? "ws_local",
       owner_user_id: "user_local",
       name: body.device_name,
       platform: body.platform,
@@ -481,14 +689,14 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     devices.set(deviceId, device);
     deviceKeys.set(keyId, key);
     audit("user", "user_local", "device.registered", {
-      workspace_id: body.workspace_id,
+      workspace_id: body.workspace_id ?? "ws_local",
       device_id: deviceId,
       metadata: { device_key_id: keyId, platform: body.platform },
     });
     console.log("[relay] device registered", {
       device_id: deviceId,
       device_key_id: keyId,
-      workspace_id: body.workspace_id,
+      workspace_id: body.workspace_id ?? "ws_local",
       public_key_bytes: body.public_key.length,
     });
     return Response.json({
@@ -547,8 +755,13 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     const body = (await req.json()) as {
       workspace_id: string;
       name: string;
-      type: "first_party" | "user_owned";
+      type: "first_party" | "user_owned" | "third_party";
       public_key: string;
+      publisher_id?: string;
+      description?: string;
+      website?: string;
+      privacy_policy_url?: string;
+      terms_url?: string;
     };
     const suffix = String(apps.size + 1).padStart(3, "0");
     const appId = `app_${suffix}`;
@@ -556,10 +769,17 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     const now = new Date().toISOString();
     const app: AppRecord = {
       id: appId,
-      workspace_id: body.workspace_id,
+      workspace_id: body.workspace_id ?? "ws_local",
       name: body.name,
+      description: body.description,
       type: body.type ?? "first_party",
       status: "active",
+      publisher_id: body.publisher_id,
+      website: body.website,
+      privacy_policy_url: body.privacy_policy_url,
+      terms_url: body.terms_url,
+      trust_status: body.type === "third_party" ? "unverified" : "official",
+      review_status: body.type === "third_party" ? "approved" : "approved",
       created_at: now,
     };
     const key: AppKeyRecord = {
@@ -572,17 +792,157 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     apps.set(appId, app);
     appKeys.set(keyId, key);
     audit("user", "user_local", "app.created", {
-      workspace_id: body.workspace_id,
+      workspace_id: app.workspace_id,
       app_id: appId,
       metadata: { app_key_id: keyId, type: app.type },
     });
     console.log("[relay] app created", {
       app_id: appId,
       app_key_id: keyId,
-      workspace_id: body.workspace_id,
+      workspace_id: app.workspace_id,
       public_key_bytes: body.public_key.length,
     });
     return Response.json({ app_id: appId, app_key_id: keyId, status: app.status });
+  }
+
+  async function handleCreateDeveloper(req: Request): Promise<Response> {
+    const body = await req.json().catch(() => ({})) as { name?: string; email?: string };
+    const id = `devacct_${String(developers.size + 1).padStart(3, "0")}`;
+    const developer: DeveloperRecord = {
+      id,
+      owner_user_id: "user_local",
+      name: body.name || "Local Developer",
+      email: body.email,
+      status: "active",
+      created_at: new Date().toISOString(),
+    };
+    developers.set(id, developer);
+    audit("user", "user_local", "developer.created", { workspace_id: "ws_local", metadata: { developer_id: id } });
+    return Response.json({ developer });
+  }
+
+  async function handleCreatePublisher(req: Request): Promise<Response> {
+    const body = await req.json().catch(() => ({})) as {
+      developer_id?: string;
+      display_name?: string;
+      website?: string;
+      support_email?: string;
+      privacy_policy_url?: string;
+      terms_url?: string;
+    };
+    if (!body.developer_id || !developers.has(body.developer_id)) return Response.json({ error: "developer denied" }, { status: 400 });
+    const id = `pub_${String(publishers.size + 1).padStart(3, "0")}`;
+    const publisher: PublisherRecord = {
+      id,
+      developer_id: body.developer_id,
+      display_name: body.display_name || "Unverified Publisher",
+      website: body.website,
+      support_email: body.support_email,
+      privacy_policy_url: body.privacy_policy_url,
+      terms_url: body.terms_url,
+      verification_status: "unverified",
+      created_at: new Date().toISOString(),
+    };
+    publishers.set(id, publisher);
+    audit("user", "user_local", "publisher.created", { workspace_id: "ws_local", metadata: { publisher_id: id } });
+    return Response.json({ publisher });
+  }
+
+  async function handleCreateDeveloperApp(req: Request): Promise<Response> {
+    const response = await handleCreateApp(req);
+    if (!response.ok) return response;
+    const body = await response.json();
+    const apiKeyResponse = await handleCreateAppApiKey(new Request("http://local", {
+      method: "POST",
+      body: JSON.stringify({ name: "Developer backend key" }),
+      headers: { "Content-Type": "application/json" },
+    }), body.app_id);
+    const apiKeyBody = await apiKeyResponse.json();
+    return Response.json({ ...body, api_key: apiKeyBody.api_key, api_key_record: apiKeyBody.key });
+  }
+
+  async function handleCreatePermissionDeclaration(req: Request, appId: string): Promise<Response> {
+    const app = apps.get(appId);
+    if (!app || app.type !== "third_party") return Response.json({ error: "third-party app not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({})) as { plugin_name?: string; channels?: string[]; reason?: string; queueing_requested?: boolean };
+    if (!body.plugin_name || !body.channels?.length) return Response.json({ error: "plugin_name and channels required" }, { status: 400 });
+    const declaration: PermissionDeclarationRecord = {
+      id: `apd_${String(permissionDeclarations.length + 1).padStart(3, "0")}`,
+      app_id: appId,
+      plugin_name: body.plugin_name,
+      channels: body.channels,
+      reason: body.reason,
+      queueing_requested: body.queueing_requested ?? false,
+      created_at: new Date().toISOString(),
+    };
+    permissionDeclarations.push(declaration);
+    audit("developer", appId, "app.permission_declared", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { declaration_id: declaration.id, plugin_name: declaration.plugin_name, channels: declaration.channels },
+    });
+    return Response.json({ declaration });
+  }
+
+  async function handleCreateConsentRequest(req: Request): Promise<Response> {
+    const body = await req.json().catch(() => ({})) as { app_id?: string; state?: string; redirect_uri?: string };
+    const app = body.app_id ? apps.get(body.app_id) : undefined;
+    if (!app || app.type !== "third_party" || app.status !== "active") return Response.json({ error: "third-party app denied" }, { status: 400 });
+    const requested = permissionDeclarations
+      .filter((item) => item.app_id === app.id)
+      .map((item) => ({ plugin: item.plugin_name, channels: item.channels, reason: item.reason }));
+    const id = `consent_${String(consentRequests.size + 1).padStart(3, "0")}`;
+    const consent: ConsentRequestRecord = {
+      id,
+      app_id: app.id,
+      user_id: "user_local",
+      state: body.state,
+      redirect_uri: body.redirect_uri,
+      requested_capabilities: requested,
+      status: "pending",
+      created_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    };
+    consentRequests.set(id, consent);
+    audit("app", app.id, "consent.requested", { workspace_id: app.workspace_id, app_id: app.id, metadata: { consent_id: id } });
+    return Response.json({ consent_request: consent });
+  }
+
+  async function handleApproveConsent(req: Request, consentId: string): Promise<Response> {
+    const consent = consentRequests.get(consentId);
+    if (!consent || consent.status !== "pending") return Response.json({ error: "consent not pending" }, { status: 404 });
+    const app = apps.get(consent.app_id);
+    if (!app) return Response.json({ error: "app not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({})) as { device_id?: string; allowed_channels?: string[]; queueing_allowed?: boolean };
+    const channels = body.allowed_channels ?? [];
+    const declared = new Set(permissionDeclarations.filter((item) => item.app_id === app.id).flatMap((item) => item.channels));
+    const undeclared = channels.filter((channel) => !declared.has(channel));
+    if (!body.device_id || channels.length === 0) return Response.json({ error: "device_id and allowed_channels required" }, { status: 400 });
+    if (undeclared.length) return Response.json({ error: `undeclared channels: ${undeclared.join(", ")}` }, { status: 400 });
+    const grantResponse = await handleCreateGrant(new Request("http://local", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: app.workspace_id,
+        app_id: app.id,
+        device_id: body.device_id,
+        allowed_channels: channels,
+        queueing_allowed: body.queueing_allowed ?? false,
+        name: "Third-party consent grant",
+      }),
+      headers: { "Content-Type": "application/json" },
+    }));
+    if (!grantResponse.ok) return grantResponse;
+    const grantBody = await grantResponse.json();
+    consent.status = "approved";
+    consent.completed_at = new Date().toISOString();
+    consent.grant_id = grantBody.grant_id;
+    audit("user", "user_local", "consent.approved", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      device_id: body.device_id,
+      metadata: { consent_id: consent.id, grant_id: consent.grant_id, channels },
+    });
+    return Response.json({ consent_request: consent, grant: grantBody.grant });
   }
 
   async function handleCreateGrant(req: Request): Promise<Response> {
@@ -693,6 +1053,34 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
           permissions: plugin.permissions,
         })),
       },
+    });
+    return Response.json({ device_id: deviceId, status: "ok", plugins_reported: body.plugins?.length ?? 0 });
+  }
+
+  async function handleReportPluginInstalls(req: Request, deviceId: string): Promise<Response> {
+    const device = devices.get(deviceId);
+    if (!device) return Response.json({ error: "not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({})) as { plugins?: Array<Record<string, any>> };
+    const now = new Date().toISOString();
+    for (const plugin of body.plugins ?? []) {
+      const record: DevicePluginCapabilityRecord = {
+        id: `install_${String(pluginInstallReports.length + 1).padStart(6, "0")}`,
+        workspace_id: device.workspace_id,
+        device_id: deviceId,
+        plugin_name: String(plugin.name),
+        plugin_version: String(plugin.version),
+        channels: plugin.channels ?? [],
+        permissions: plugin.permissions ?? [],
+        manifest: plugin,
+        reported_at: now,
+      };
+      pluginInstallReports.push(record);
+      capabilities.push(record);
+    }
+    audit("device", deviceId, "plugin.install_reported", {
+      workspace_id: device.workspace_id,
+      device_id: deviceId,
+      metadata: { plugins: (body.plugins ?? []).map((plugin) => ({ name: plugin.name, trust_level: plugin.trust_level, signature_status: plugin.signature_status })) },
     });
     return Response.json({ device_id: deviceId, status: "ok", plugins_reported: body.plugins?.length ?? 0 });
   }
@@ -891,6 +1279,45 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     return Response.json({ device_id: device.id, status: device.status });
   }
 
+  async function handleReportApp(req: Request, appId: string): Promise<Response> {
+    const app = apps.get(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({})) as { reason?: string; description?: string };
+    const report: AppAbuseReportRecord = {
+      id: `report_${String(abuseReports.length + 1).padStart(3, "0")}`,
+      app_id: appId,
+      reporter_user_id: "user_local",
+      reason: body.reason || "other",
+      description: body.description,
+      status: "open",
+      created_at: new Date().toISOString(),
+    };
+    abuseReports.push(report);
+    audit("user", "user_local", "app.reported", { workspace_id: app.workspace_id, app_id: app.id, metadata: { report_id: report.id, reason: report.reason } });
+    return Response.json({ report });
+  }
+
+  function handleSuspendApp(appId: string): Response {
+    const app = apps.get(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    app.status = "suspended";
+    app.disabled_at = new Date().toISOString();
+    app.disabled_by = "admin_local";
+    audit("admin", "admin_local", "app.suspended", { workspace_id: app.workspace_id, app_id: app.id, metadata: { app_id: app.id } });
+    return Response.json({ app: appView(app) });
+  }
+
+  function listAuthorizedApps(): Response {
+    const rows = [...apps.values()]
+      .filter((app) => app.type === "third_party")
+      .map((app) => ({
+        app: appView(app),
+        grants: [...grants.values()].filter((grant) => grant.app_id === app.id).map(grantView),
+        reports: abuseReports.filter((report) => report.app_id === app.id),
+      }));
+    return Response.json({ authorized_apps: rows });
+  }
+
   function handleListGrantedAppDevices(req: Request): Response {
     const auth = authenticateAppRequest(req);
     if (auth instanceof Response) return auth;
@@ -1021,6 +1448,9 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
             name: app.name,
             type: app.type,
             status: app.status,
+            publisher: publisherView(app.publisher_id),
+            trust_status: app.trust_status,
+            review_status: app.review_status,
             authorized_device_count: new Set(activeGrants.map((grant) => grant.device_id)).size,
             allowed_channel_count: new Set(activeGrants.flatMap((grant) => grant.allowed_channels)).size,
             created_at: app.created_at,
@@ -1036,6 +1466,45 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         return handleCreateApp(req);
       }
 
+      if (url.pathname === "/v1/developers" && req.method === "POST") {
+        return handleCreateDeveloper(req);
+      }
+
+      if (url.pathname === "/v1/publishers" && req.method === "POST") {
+        return handleCreatePublisher(req);
+      }
+
+      if (url.pathname === "/v1/developer/apps" && req.method === "POST") {
+        return handleCreateDeveloperApp(req);
+      }
+
+      const declarationMatch = url.pathname.match(/^\/v1\/developer\/apps\/([^/]+)\/permission-declarations$/);
+      if (declarationMatch && req.method === "POST") {
+        return handleCreatePermissionDeclaration(req, declarationMatch[1]);
+      }
+
+      if (url.pathname === "/v1/consent-requests" && req.method === "POST") {
+        return handleCreateConsentRequest(req);
+      }
+
+      const consentMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)$/);
+      if (consentMatch && req.method === "GET") {
+        const consent = consentRequests.get(consentMatch[1]);
+        if (!consent) return Response.json({ error: "not found" }, { status: 404 });
+        const app = apps.get(consent.app_id);
+        return Response.json({
+          consent_request: consent,
+          app: app ? appView(app) : undefined,
+          devices: [...devices.values()].filter((device) => device.status !== "revoked"),
+          capabilities,
+        });
+      }
+
+      const consentApproveMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)\/approve$/);
+      if (consentApproveMatch && req.method === "POST") {
+        return handleApproveConsent(req, consentApproveMatch[1]);
+      }
+
       if (url.pathname === "/v1/grants" && req.method === "POST") {
         const rejected = rejectAppApiKeyOnControlPlane(req);
         if (rejected) return rejected;
@@ -1049,6 +1518,11 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       const capabilitiesMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/capabilities$/);
       if (capabilitiesMatch && req.method === "POST") {
         return handleReportCapabilities(req, capabilitiesMatch[1]);
+      }
+
+      const pluginReportMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/plugins\/report$/);
+      if (pluginReportMatch && req.method === "POST") {
+        return handleReportPluginInstalls(req, pluginReportMatch[1]);
       }
 
       const grantRevokeMatch = url.pathname.match(/^\/v1\/grants\/([^/]+)\/revoke$/);
@@ -1082,6 +1556,57 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         const rejected = rejectAppApiKeyOnControlPlane(req);
         if (rejected) return rejected;
         return handleRevokeApp(appRevokeMatch[1]);
+      }
+
+      const appReportMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/report$/);
+      if (appReportMatch && req.method === "POST") {
+        return handleReportApp(req, appReportMatch[1]);
+      }
+
+      const appSuspendMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/suspend$/);
+      if (appSuspendMatch && req.method === "POST") {
+        return handleSuspendApp(appSuspendMatch[1]);
+      }
+
+      if (url.pathname === "/v1/authorized-apps" && req.method === "GET") {
+        return listAuthorizedApps();
+      }
+
+      if (url.pathname === "/v1/plugins" && req.method === "GET") {
+        return Response.json({ plugins: ["echo", "hermes", "codex", "community-signed", "community-unsigned"].map((name) => registryPluginResponse(name)?.plugin).filter(Boolean) });
+      }
+
+      const pluginVersionMatch = url.pathname.match(/^\/v1\/plugins\/([^/]+)\/versions\/([^/]+)$/);
+      if (pluginVersionMatch && req.method === "GET") {
+        const plugin = registryPluginResponse(pluginVersionMatch[1], pluginVersionMatch[2]);
+        return plugin ? Response.json(plugin) : Response.json({ error: "not found" }, { status: 404 });
+      }
+
+      const pluginMatch = url.pathname.match(/^\/v1\/plugins\/([^/]+)$/);
+      if (pluginMatch && req.method === "GET") {
+        const plugin = registryPluginResponse(pluginMatch[1]);
+        return plugin ? Response.json(plugin) : Response.json({ error: "not found" }, { status: 404 });
+      }
+
+      if (url.pathname === "/v1/plugin-registry/resolve" && req.method === "GET") {
+        const plugin = registryPluginResponse(url.searchParams.get("name") ?? "", url.searchParams.get("version") ?? "latest");
+        return plugin ? Response.json(plugin) : Response.json({ error: "not found" }, { status: 404 });
+      }
+
+      if (url.pathname === "/v1/workspace/plugin-policy" && req.method === "GET") {
+        return Response.json({ policy: workspacePluginPolicy });
+      }
+
+      if (url.pathname === "/v1/workspace/plugin-policy" && req.method === "PATCH") {
+        const body = await req.json().catch(() => ({})) as Partial<WorkspacePluginPolicyRecord>;
+        if (body.require_signature !== undefined) workspacePluginPolicy.require_signature = body.require_signature;
+        if (body.allowed_trust_levels) workspacePluginPolicy.allowed_trust_levels = body.allowed_trust_levels;
+        if (body.allowed_plugins) workspacePluginPolicy.allowed_plugins = body.allowed_plugins;
+        if (body.blocked_plugins) workspacePluginPolicy.blocked_plugins = body.blocked_plugins;
+        if (body.require_approval_for_permission_increase !== undefined) workspacePluginPolicy.require_approval_for_permission_increase = body.require_approval_for_permission_increase;
+        workspacePluginPolicy.updated_at = new Date().toISOString();
+        audit("user", "user_local", "workspace.plugin_policy_updated", { workspace_id: "ws_local", metadata: { policy: workspacePluginPolicy } });
+        return Response.json({ policy: workspacePluginPolicy });
       }
 
       const deviceRevokeMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/revoke$/);
@@ -1130,7 +1655,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         );
         const appGrants = [...grants.values()].filter((grant) => grant.app_id === app.id).map(grantView);
         return Response.json({
-          app,
+          app: appView(app),
           active_key,
           api_keys: [...appApiKeys.values()].filter((key) => key.app_id === app.id).map(appApiKeyView),
           grants: appGrants,

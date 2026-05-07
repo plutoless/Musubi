@@ -62,6 +62,7 @@ jobs:
           bun run verify:m2.5-codex
           bun run verify:m3-app-sdk
           bun run verify:m3.5-browser-session
+          bun run verify:m4-platform-trust
 
       - name: Verify hosted Worker build
         run: bun run verify:slice11:build
