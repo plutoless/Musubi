@@ -8,6 +8,8 @@ import {
   visibleEnvelopeLog,
 } from "../../../packages/protocol/src/index.ts";
 import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 type DeviceSocket = ServerWebSocket<{ deviceId: string }>;
 
@@ -100,6 +102,7 @@ interface GrantRecord {
   description?: string;
   allowed_channels: string[];
   queueing_allowed: boolean;
+  created_from_consent_request_id?: string;
   created_at: string;
   updated_at?: string;
   revoked_at?: string;
@@ -225,26 +228,48 @@ interface RegistryPluginVersion {
   signature_status?: "verified" | "invalid" | "unsigned";
 }
 
+interface RelayStateSnapshot {
+  messages?: StoredMessage[];
+  devices?: DeviceRecord[];
+  deviceKeys?: DeviceKeyRecord[];
+  apps?: AppRecord[];
+  appKeys?: AppKeyRecord[];
+  appApiKeys?: AppApiKeyRecord[];
+  grants?: GrantRecord[];
+  capabilities?: DevicePluginCapabilityRecord[];
+  developers?: DeveloperRecord[];
+  publishers?: PublisherRecord[];
+  permissionDeclarations?: PermissionDeclarationRecord[];
+  consentRequests?: ConsentRequestRecord[];
+  abuseReports?: AppAbuseReportRecord[];
+  pluginInstallReports?: DevicePluginCapabilityRecord[];
+  auditEvents?: AuditEventRecord[];
+  messageStatusEvents?: MessageStatusEventRecord[];
+  workspacePluginPolicy?: WorkspacePluginPolicyRecord;
+}
+
 export function startRelay(options: { hostname?: string; port?: number } = {}) {
-  const messages = new Map<string, StoredMessage>();
-  const devices = new Map<string, DeviceRecord>();
-  const deviceKeys = new Map<string, DeviceKeyRecord>();
-  const apps = new Map<string, AppRecord>();
-  const appKeys = new Map<string, AppKeyRecord>();
-  const appApiKeys = new Map<string, AppApiKeyRecord>();
-  const grants = new Map<string, GrantRecord>();
-  const capabilities: DevicePluginCapabilityRecord[] = [];
-  const developers = new Map<string, DeveloperRecord>();
-  const publishers = new Map<string, PublisherRecord>();
-  const permissionDeclarations: PermissionDeclarationRecord[] = [];
-  const consentRequests = new Map<string, ConsentRequestRecord>();
-  const abuseReports: AppAbuseReportRecord[] = [];
-  const pluginInstallReports: DevicePluginCapabilityRecord[] = [];
-  const auditEvents: AuditEventRecord[] = [];
-  const messageStatusEvents: MessageStatusEventRecord[] = [];
+  const statePath = process.env.MUSUBI_RELAY_STATE_PATH;
+  const initialState = loadRelayState(statePath);
+  const messages = new Map<string, StoredMessage>((initialState.messages ?? []).map((item) => [item.envelope.message_id, item]));
+  const devices = new Map<string, DeviceRecord>((initialState.devices ?? []).map((item) => [item.id, item]));
+  const deviceKeys = new Map<string, DeviceKeyRecord>((initialState.deviceKeys ?? []).map((item) => [item.id, item]));
+  const apps = new Map<string, AppRecord>((initialState.apps ?? []).map((item) => [item.id, item]));
+  const appKeys = new Map<string, AppKeyRecord>((initialState.appKeys ?? []).map((item) => [item.id, item]));
+  const appApiKeys = new Map<string, AppApiKeyRecord>((initialState.appApiKeys ?? []).map((item) => [item.id, item]));
+  const grants = new Map<string, GrantRecord>((initialState.grants ?? []).map((item) => [item.id, item]));
+  const capabilities: DevicePluginCapabilityRecord[] = [...(initialState.capabilities ?? [])];
+  const developers = new Map<string, DeveloperRecord>((initialState.developers ?? []).map((item) => [item.id, item]));
+  const publishers = new Map<string, PublisherRecord>((initialState.publishers ?? []).map((item) => [item.id, item]));
+  const permissionDeclarations: PermissionDeclarationRecord[] = [...(initialState.permissionDeclarations ?? [])];
+  const consentRequests = new Map<string, ConsentRequestRecord>((initialState.consentRequests ?? []).map((item) => [item.id, item]));
+  const abuseReports: AppAbuseReportRecord[] = [...(initialState.abuseReports ?? [])];
+  const pluginInstallReports: DevicePluginCapabilityRecord[] = [...(initialState.pluginInstallReports ?? [])];
+  const auditEvents: AuditEventRecord[] = [...(initialState.auditEvents ?? [])];
+  const messageStatusEvents: MessageStatusEventRecord[] = [...(initialState.messageStatusEvents ?? [])];
   const pluginSigningKey = generateKeyPairSync("ed25519");
   const pluginSigningKeyId = "pluginkey_musubi_local";
-  const workspacePluginPolicy: WorkspacePluginPolicyRecord = {
+  const workspacePluginPolicy: WorkspacePluginPolicyRecord = initialState.workspacePluginPolicy ?? {
     require_signature: true,
     allowed_trust_levels: ["official", "verified"],
     allowed_plugins: ["echo", "hermes", "codex"],
@@ -252,6 +277,31 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     require_approval_for_permission_increase: true,
   };
   let deviceSocket: DeviceSocket | undefined;
+
+  function persistState() {
+    if (!statePath) return;
+    const snapshot: RelayStateSnapshot = {
+      messages: [...messages.values()],
+      devices: [...devices.values()].map((device) => device.status === "online" ? { ...device, status: "offline" } : device),
+      deviceKeys: [...deviceKeys.values()],
+      apps: [...apps.values()],
+      appKeys: [...appKeys.values()],
+      appApiKeys: [...appApiKeys.values()],
+      grants: [...grants.values()],
+      capabilities,
+      developers: [...developers.values()],
+      publishers: [...publishers.values()],
+      permissionDeclarations,
+      consentRequests: [...consentRequests.values()],
+      abuseReports,
+      pluginInstallReports,
+      auditEvents,
+      messageStatusEvents,
+      workspacePluginPolicy,
+    };
+    mkdirSync(dirname(statePath), { recursive: true });
+    writeFileSync(statePath, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 });
+  }
 
   function transition(messageId: string, status: MessageState, fields: { error_code?: string; error_message?: string } = {}) {
     const item = messages.get(messageId);
@@ -329,6 +379,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       metadata: fields.metadata ?? {},
       created_at: new Date().toISOString(),
     });
+    persistState();
   }
 
   function authorize(envelope: MessageEnvelope): string | undefined {
@@ -394,6 +445,8 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     const app = apps.get(appId);
     if (!app || app.status !== "active") return app?.status === "suspended" ? "app suspended" : "app denied";
     if (app.trust_status === "blocked") return "app blocked";
+    const publisher = publisherView(app.publisher_id);
+    if (publisher?.verification_status === "suspended") return "publisher suspended";
     if (app.type === "third_party" && !declaresChannel(app.id, channel)) return "undeclared channel denied";
     const device = devices.get(deviceId);
     if (!device) return "device denied";
@@ -433,6 +486,14 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
 
   function publisherView(publisherId?: string) {
     return publisherId ? publishers.get(publisherId) : undefined;
+  }
+
+  function callbackUrl(base: string, state: string | undefined, status: string, grantId?: string) {
+    const url = new URL(base);
+    url.searchParams.set("status", status);
+    if (state) url.searchParams.set("state", state);
+    if (grantId) url.searchParams.set("grant_id", grantId);
+    return url.toString();
   }
 
   function appView(app: AppRecord) {
@@ -796,13 +857,20 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       app_id: appId,
       metadata: { app_key_id: keyId, type: app.type },
     });
+    if (app.type === "third_party") {
+      audit("developer", app.publisher_id, "third_party_app.created", {
+        workspace_id: app.workspace_id,
+        app_id: app.id,
+        metadata: { app_key_id: keyId, publisher_id: app.publisher_id },
+      });
+    }
     console.log("[relay] app created", {
       app_id: appId,
       app_key_id: keyId,
       workspace_id: app.workspace_id,
       public_key_bytes: body.public_key.length,
     });
-    return Response.json({ app_id: appId, app_key_id: keyId, status: app.status });
+    return Response.json({ app_id: appId, app_key_id: keyId, status: app.status, trust_status: app.trust_status });
   }
 
   async function handleCreateDeveloper(req: Request): Promise<Response> {
@@ -818,6 +886,20 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     };
     developers.set(id, developer);
     audit("user", "user_local", "developer.created", { workspace_id: "ws_local", metadata: { developer_id: id } });
+    return Response.json({ developer });
+  }
+
+  async function handleUpdateDeveloper(req: Request, developerId: string): Promise<Response> {
+    const developer = developers.get(developerId);
+    if (!developer) return Response.json({ error: "not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({})) as Partial<DeveloperRecord>;
+    if (body.name !== undefined) developer.name = body.name;
+    if (body.email !== undefined) developer.email = body.email;
+    if (body.status === "active" || body.status === "suspended") {
+      developer.status = body.status;
+      if (body.status === "suspended") developer.suspended_at = new Date().toISOString();
+    }
+    audit("user", "user_local", developer.status === "suspended" ? "developer.suspended" : "developer.updated", { workspace_id: "ws_local", metadata: { developer_id: developer.id } });
     return Response.json({ developer });
   }
 
@@ -848,17 +930,42 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     return Response.json({ publisher });
   }
 
+  async function handleUpdatePublisher(req: Request, publisherId: string): Promise<Response> {
+    const publisher = publishers.get(publisherId);
+    if (!publisher) return Response.json({ error: "not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({})) as Partial<PublisherRecord>;
+    for (const field of ["display_name", "website", "support_email", "privacy_policy_url", "terms_url", "logo_url"] as const) {
+      if (body[field] !== undefined) publisher[field] = body[field] as string | undefined;
+    }
+    if (body.verification_status === "unverified" || body.verification_status === "verified" || body.verification_status === "suspended") {
+      publisher.verification_status = body.verification_status;
+    }
+    publisher.updated_at = new Date().toISOString();
+    const eventType = publisher.verification_status === "verified"
+      ? "publisher.verified"
+      : publisher.verification_status === "suspended"
+        ? "publisher.suspended"
+        : "publisher.updated";
+    audit("user", "user_local", eventType, { workspace_id: "ws_local", metadata: { publisher_id: publisher.id } });
+    return Response.json({ publisher });
+  }
+
   async function handleCreateDeveloperApp(req: Request): Promise<Response> {
-    const response = await handleCreateApp(req);
+    const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+    const response = await handleCreateApp(new Request("http://local", {
+      method: "POST",
+      body: JSON.stringify({ ...body, workspace_id: body.workspace_id ?? "ws_local", type: "third_party" }),
+      headers: { "Content-Type": "application/json" },
+    }));
     if (!response.ok) return response;
-    const body = await response.json();
+    const appBody = await response.json();
     const apiKeyResponse = await handleCreateAppApiKey(new Request("http://local", {
       method: "POST",
       body: JSON.stringify({ name: "Developer backend key" }),
       headers: { "Content-Type": "application/json" },
-    }), body.app_id);
+    }), appBody.app_id);
     const apiKeyBody = await apiKeyResponse.json();
-    return Response.json({ ...body, api_key: apiKeyBody.api_key, api_key_record: apiKeyBody.key });
+    return Response.json({ ...appBody, api_key: apiKeyBody.api_key, api_key_record: apiKeyBody.key });
   }
 
   async function handleCreatePermissionDeclaration(req: Request, appId: string): Promise<Response> {
@@ -881,16 +988,25 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       app_id: app.id,
       metadata: { declaration_id: declaration.id, plugin_name: declaration.plugin_name, channels: declaration.channels },
     });
+    audit("developer", appId, "permission_declaration.created", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { declaration_id: declaration.id, plugin_name: declaration.plugin_name, channels: declaration.channels },
+    });
     return Response.json({ declaration });
   }
 
   async function handleCreateConsentRequest(req: Request): Promise<Response> {
-    const body = await req.json().catch(() => ({})) as { app_id?: string; state?: string; redirect_uri?: string };
+    const body = await req.json().catch(() => ({})) as { app_id?: string; state?: string; redirect_uri?: string; requested_capabilities?: Array<{ plugin: string; channels: string[]; reason?: string }> };
     const app = body.app_id ? apps.get(body.app_id) : undefined;
     if (!app || app.type !== "third_party" || app.status !== "active") return Response.json({ error: "third-party app denied" }, { status: 400 });
-    const requested = permissionDeclarations
+    const declared = permissionDeclarations
       .filter((item) => item.app_id === app.id)
       .map((item) => ({ plugin: item.plugin_name, channels: item.channels, reason: item.reason }));
+    const requested = body.requested_capabilities?.length ? body.requested_capabilities : declared;
+    const declaredChannels = new Set(declared.flatMap((item) => item.channels));
+    const undeclared = requested.flatMap((item) => item.channels).filter((channel) => !declaredChannels.has(channel));
+    if (undeclared.length) return Response.json({ error: `undeclared channels: ${undeclared.join(", ")}` }, { status: 400 });
     const id = `consent_${String(consentRequests.size + 1).padStart(3, "0")}`;
     const consent: ConsentRequestRecord = {
       id,
@@ -905,7 +1021,14 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     };
     consentRequests.set(id, consent);
     audit("app", app.id, "consent.requested", { workspace_id: app.workspace_id, app_id: app.id, metadata: { consent_id: id } });
-    return Response.json({ consent_request: consent });
+    audit("app", app.id, "consent_request.created", { workspace_id: app.workspace_id, app_id: app.id, metadata: { consent_id: id } });
+    return Response.json({
+      consent_request: consent,
+      consent_request_id: id,
+      consent_url: `/control-plane#consent/${id}`,
+      status: consent.status,
+      expires_at: consent.expires_at,
+    });
   }
 
   async function handleApproveConsent(req: Request, consentId: string): Promise<Response> {
@@ -928,6 +1051,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         allowed_channels: channels,
         queueing_allowed: body.queueing_allowed ?? false,
         name: "Third-party consent grant",
+        created_from_consent_request_id: consent.id,
       }),
       headers: { "Content-Type": "application/json" },
     }));
@@ -942,7 +1066,39 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       device_id: body.device_id,
       metadata: { consent_id: consent.id, grant_id: consent.grant_id, channels },
     });
-    return Response.json({ consent_request: consent, grant: grantBody.grant });
+    audit("user", "user_local", "consent_request.approved", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      device_id: body.device_id,
+      metadata: { consent_id: consent.id, grant_id: consent.grant_id, channels },
+    });
+    return Response.json({
+      status: "approved",
+      grant_id: consent.grant_id,
+      redirect_uri: consent.redirect_uri ? callbackUrl(consent.redirect_uri, consent.state, "approved", consent.grant_id) : undefined,
+      consent_request: consent,
+      grant: grantBody.grant,
+    });
+  }
+
+  async function handleDenyConsent(req: Request, consentId: string): Promise<Response> {
+    const consent = consentRequests.get(consentId);
+    if (!consent || consent.status !== "pending") return Response.json({ error: "consent not pending" }, { status: 404 });
+    const app = apps.get(consent.app_id);
+    if (!app) return Response.json({ error: "app not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({})) as { reason?: string };
+    consent.status = "cancelled";
+    consent.completed_at = new Date().toISOString();
+    audit("user", "user_local", "consent_request.denied", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { consent_id: consent.id, reason: body.reason || "user_denied" },
+    });
+    return Response.json({
+      status: "denied",
+      redirect_uri: consent.redirect_uri ? callbackUrl(consent.redirect_uri, consent.state, "denied") : undefined,
+      consent_request: consent,
+    });
   }
 
   async function handleCreateGrant(req: Request): Promise<Response> {
@@ -954,6 +1110,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       queueing_allowed?: boolean;
       name?: string;
       description?: string;
+      created_from_consent_request_id?: string;
     };
     const denied = checkGrantPreconditions(body.workspace_id, body.app_id, body.device_id);
     if (denied) return Response.json({ status: "failed", error: denied }, { status: 400 });
@@ -969,6 +1126,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       description: body.description,
       allowed_channels: body.allowed_channels,
       queueing_allowed: body.queueing_allowed ?? false,
+      created_from_consent_request_id: body.created_from_consent_request_id,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
@@ -1254,6 +1412,13 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       app_id: app.id,
       metadata: { app_id: app.id },
     });
+    if (app.type === "third_party") {
+      audit("user", "user_local", "third_party_app.revoked", {
+        workspace_id: app.workspace_id,
+        app_id: app.id,
+        metadata: { app_id: app.id },
+      });
+    }
     return Response.json({ app_id: app.id, status: app.status });
   }
 
@@ -1294,6 +1459,9 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     };
     abuseReports.push(report);
     audit("user", "user_local", "app.reported", { workspace_id: app.workspace_id, app_id: app.id, metadata: { report_id: report.id, reason: report.reason } });
+    if (app.type === "third_party") {
+      audit("user", "user_local", "third_party_app.reported", { workspace_id: app.workspace_id, app_id: app.id, metadata: { report_id: report.id, reason: report.reason } });
+    }
     return Response.json({ report });
   }
 
@@ -1304,6 +1472,9 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
     app.disabled_at = new Date().toISOString();
     app.disabled_by = "admin_local";
     audit("admin", "admin_local", "app.suspended", { workspace_id: app.workspace_id, app_id: app.id, metadata: { app_id: app.id } });
+    if (app.type === "third_party") {
+      audit("admin", "admin_local", "third_party_app.suspended", { workspace_id: app.workspace_id, app_id: app.id, metadata: { app_id: app.id } });
+    }
     return Response.json({ app: appView(app) });
   }
 
@@ -1315,7 +1486,7 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         grants: [...grants.values()].filter((grant) => grant.app_id === app.id).map(grantView),
         reports: abuseReports.filter((report) => report.app_id === app.id),
       }));
-    return Response.json({ authorized_apps: rows });
+    return Response.json({ authorized_apps: rows, apps: rows });
   }
 
   function handleListGrantedAppDevices(req: Request): Response {
@@ -1470,12 +1641,35 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         return handleCreateDeveloper(req);
       }
 
+      if (url.pathname === "/v1/developers" && req.method === "GET") {
+        return Response.json({ developers: [...developers.values()].sort((a, b) => a.id.localeCompare(b.id)) });
+      }
+
+      const developerMatch = url.pathname.match(/^\/v1\/developers\/([^/]+)$/);
+      if (developerMatch && req.method === "PATCH") {
+        return handleUpdateDeveloper(req, developerMatch[1]);
+      }
+
       if (url.pathname === "/v1/publishers" && req.method === "POST") {
         return handleCreatePublisher(req);
       }
 
+      if (url.pathname === "/v1/publishers" && req.method === "GET") {
+        return Response.json({ publishers: [...publishers.values()].sort((a, b) => a.id.localeCompare(b.id)) });
+      }
+
+      const publisherMatch = url.pathname.match(/^\/v1\/publishers\/([^/]+)$/);
+      if (publisherMatch && req.method === "PATCH") {
+        return handleUpdatePublisher(req, publisherMatch[1]);
+      }
+
       if (url.pathname === "/v1/developer/apps" && req.method === "POST") {
         return handleCreateDeveloperApp(req);
+      }
+
+      const developerApiKeyMatch = url.pathname.match(/^\/v1\/developer\/apps\/([^/]+)\/api-keys$/);
+      if (developerApiKeyMatch && req.method === "POST") {
+        return handleCreateAppApiKey(req, developerApiKeyMatch[1]);
       }
 
       const declarationMatch = url.pathname.match(/^\/v1\/developer\/apps\/([^/]+)\/permission-declarations$/);
@@ -1492,10 +1686,14 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
         const consent = consentRequests.get(consentMatch[1]);
         if (!consent) return Response.json({ error: "not found" }, { status: 404 });
         const app = apps.get(consent.app_id);
+        const consentDevices = [...devices.values()].filter((device) => device.status !== "revoked");
         return Response.json({
           consent_request: consent,
           app: app ? appView(app) : undefined,
-          devices: [...devices.values()].filter((device) => device.status !== "revoked"),
+          publisher: app ? publisherView(app.publisher_id) : undefined,
+          permission_declarations: app ? permissionDeclarations.filter((item) => item.app_id === app.id) : [],
+          devices: consentDevices,
+          eligible_devices: consentDevices,
           capabilities,
         });
       }
@@ -1503,6 +1701,11 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       const consentApproveMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)\/approve$/);
       if (consentApproveMatch && req.method === "POST") {
         return handleApproveConsent(req, consentApproveMatch[1]);
+      }
+
+      const consentDenyMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)\/deny$/);
+      if (consentDenyMatch && req.method === "POST") {
+        return handleDenyConsent(req, consentDenyMatch[1]);
       }
 
       if (url.pathname === "/v1/grants" && req.method === "POST") {
@@ -1809,4 +2012,11 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
 
 if (import.meta.main) {
   startRelay();
+}
+
+function loadRelayState(path?: string): RelayStateSnapshot {
+  if (!path || !existsSync(path)) return {};
+  const raw = readFileSync(path, "utf8").trim();
+  if (!raw) return {};
+  return JSON.parse(raw) as RelayStateSnapshot;
 }

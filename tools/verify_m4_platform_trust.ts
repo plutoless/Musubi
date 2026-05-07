@@ -9,12 +9,14 @@ process.env.no_proxy = ["127.0.0.1", "localhost", process.env.no_proxy].filter(B
 const port = String(35000 + Math.floor(Math.random() * 1000));
 const serverUrl = `http://127.0.0.1:${port}`;
 const home = `${process.cwd()}/.musubi/m4-platform-trust`;
+const relayStatePath = `${home}/relay-state.json`;
 const workspace = process.cwd();
 
 await rm(home, { recursive: true, force: true });
 await assertArtifacts();
 
-const server = startRelay({ hostname: "127.0.0.1", port: Number(port) });
+process.env.MUSUBI_RELAY_STATE_PATH = relayStatePath;
+let server = startRelay({ hostname: "127.0.0.1", port: Number(port) });
 let device: ChildProcessWithoutNullStreams | undefined;
 
 try {
@@ -53,12 +55,19 @@ try {
 
   const keyPair = generateX25519KeyPair();
   const developer = await postJson<any>(`${serverUrl}/v1/developers`, { name: "M4 Developer", email: "m4@example.test" });
+  const developers = await requestJson<any>(`${serverUrl}/v1/developers`);
+  if (!developers.developers.find((item: any) => item.id === developer.developer.id)) throw new Error("developer account was not listed");
   const publisher = await postJson<any>(`${serverUrl}/v1/publishers`, {
     developer_id: developer.developer.id,
     display_name: "M4 Publisher",
     website: "https://example.test",
     privacy_policy_url: "https://example.test/privacy",
   });
+  await patchJson(`${serverUrl}/v1/publishers/${publisher.publisher.id}`, { verification_status: "verified" });
+  const publishers = await requestJson<any>(`${serverUrl}/v1/publishers`);
+  if (!publishers.publishers.find((item: any) => item.id === publisher.publisher.id && item.verification_status === "verified")) {
+    throw new Error("publisher verification state was not listed");
+  }
   const app = await postJson<any>(`${serverUrl}/v1/developer/apps`, {
     workspace_id: "ws_local",
     name: "M4 Third-party Codex",
@@ -69,19 +78,51 @@ try {
   });
   const apiKey = app.api_key;
   if (!apiKey?.startsWith("musubi_app_sk_")) throw new Error("developer app did not receive API key");
+  const extraKey = await postJson<any>(`${serverUrl}/v1/developer/apps/${app.app_id}/api-keys`, { name: "Verifier backend key" });
+  if (!extraKey.api_key?.startsWith("musubi_app_sk_")) throw new Error("developer API key creation failed");
 
   await postJson(`${serverUrl}/v1/developer/apps/${app.app_id}/permission-declarations`, {
     plugin_name: "codex",
     channels: ["codex.task.create", "codex.task.cancel", "codex.task.status"],
     reason: "Create scoped local coding tasks",
   });
-  const consent = await postJson<any>(`${serverUrl}/v1/consent-requests`, { app_id: app.app_id, state: "m4" });
+  const deniedConsent = await postJson<any>(`${serverUrl}/v1/consent-requests`, {
+    app_id: app.app_id,
+    state: "m4-deny",
+    redirect_uri: "https://example.test/callback",
+    requested_capabilities: [{ plugin: "codex", channels: ["codex.task.create"], reason: "Verifier denial" }],
+  });
+  if (!deniedConsent.consent_url?.includes(deniedConsent.consent_request.id)) throw new Error("consent request did not include a consent URL");
+  const denied = await postJson<any>(`${serverUrl}/v1/consent-requests/${deniedConsent.consent_request.id}/deny`, { reason: "user_declined" });
+  if (denied.status !== "denied" || !denied.redirect_uri.includes("status=denied")) throw new Error("consent denial did not return callback status");
+
+  const consent = await postJson<any>(`${serverUrl}/v1/consent-requests`, {
+    app_id: app.app_id,
+    state: "m4",
+    redirect_uri: "https://example.test/callback",
+  });
+  if (!consent.consent_url?.includes(consent.consent_request.id)) throw new Error("consent request did not include a consent URL");
   const consentDetail = await requestJson<any>(`${serverUrl}/v1/consent-requests/${consent.consent_request.id}`);
   if (consentDetail.app.publisher.display_name !== "M4 Publisher") throw new Error("consent did not include publisher identity");
-  await postJson(`${serverUrl}/v1/consent-requests/${consent.consent_request.id}/approve`, {
+  if (!consentDetail.publisher || consentDetail.permission_declarations.length !== 1 || !consentDetail.eligible_devices.find((item: any) => item.id === "dev_001")) {
+    throw new Error("consent detail did not include publisher, declarations, and eligible devices");
+  }
+  const approved = await postJson<any>(`${serverUrl}/v1/consent-requests/${consent.consent_request.id}/approve`, {
     device_id: "dev_001",
     allowed_channels: ["codex.task.create", "codex.task.cancel", "codex.task.status"],
   });
+  if (!approved.grant_id || !approved.redirect_uri.includes("status=approved")) throw new Error("consent approval did not return grant callback status");
+
+  server.stop(true);
+  await Bun.sleep(100);
+  server = startRelay({ hostname: "127.0.0.1", port: Number(port) });
+  const resumedConsent = await requestJson<any>(`${serverUrl}/v1/consent-requests/${consent.consent_request.id}`);
+  if (resumedConsent.consent_request.status !== "approved") throw new Error("approved consent did not survive relay restart");
+  const resumedGrants = await requestJson<any>(`${serverUrl}/v1/grants?app_id=${app.app_id}`);
+  if (!resumedGrants.grants.find((grant: any) => grant.status === "active")) throw new Error("consent grant did not survive relay restart");
+  const resumedApp = await requestJson<any>(`${serverUrl}/v1/apps/${app.app_id}`);
+  if (resumedApp.app.publisher.display_name !== "M4 Publisher") throw new Error("developer/publisher/app state did not survive relay restart");
+
   await writePolicy(home, app.app_id, [workspace]);
 
   device = spawn("go", ["run", "./cmd/musubi", "start", "--home", home], {
@@ -137,6 +178,13 @@ try {
     device_id: "dev_001",
     allowed_channels: ["codex.task.create"],
   });
+  await patchJson(`${serverUrl}/v1/publishers/${publisher.publisher.id}`, { verification_status: "suspended" });
+  await expectSDKDenied(() => client.invoke({
+    deviceId: "dev_001",
+    channel: "codex.task.create",
+    payload: codexPayload("M4_PUBLISHER_SUSPENDED_SECRET", { workspaceHint: workspace, maxDurationSeconds: 5 }),
+  }), "suspended publisher still allowed send");
+  await patchJson(`${serverUrl}/v1/publishers/${publisher.publisher.id}`, { verification_status: "verified" });
   await postJson(`${serverUrl}/v1/apps/${app.app_id}/suspend`, {});
   await expectSDKDenied(() => client.devices.listGranted(), "suspended app still authenticated");
 
@@ -145,8 +193,28 @@ try {
   if (!JSON.stringify(authorized).includes("M4 Publisher")) throw new Error("authorized apps did not include publisher");
   if (!JSON.stringify(authorized).includes("suspicious")) throw new Error("authorized apps did not include report");
 
-  const audit = await requestJson<any>(`${serverUrl}/v1/audit-events`);
-  for (const event of ["developer.created", "publisher.created", "app.permission_declared", "consent.approved", "grant.revoked", "app.reported", "app.suspended", "plugin.install_reported", "plugin.update_checked", "message.completed"]) {
+  const audit = await requestJson<any>(`${serverUrl}/v1/audit-events?limit=100`);
+  for (const event of [
+    "developer.created",
+    "publisher.created",
+    "publisher.verified",
+    "publisher.suspended",
+    "third_party_app.created",
+    "app.permission_declared",
+    "permission_declaration.created",
+    "consent_request.created",
+    "consent_request.denied",
+    "consent.approved",
+    "consent_request.approved",
+    "grant.revoked",
+    "app.reported",
+    "third_party_app.reported",
+    "app.suspended",
+    "third_party_app.suspended",
+    "plugin.install_reported",
+    "plugin.update_checked",
+    "message.completed",
+  ]) {
     if (!audit.audit_events.find((item: any) => item.event_type === event)) throw new Error(`missing audit event ${event}`);
   }
 } finally {
@@ -162,6 +230,9 @@ async function assertArtifacts() {
     "docs/third_party_app_platform_m4.md",
     "docs/plugin_registry_trust_m4_5.md",
     "docs/musubi_m_4_third_party_app_and_m_4_5_plugin_trust_plan.md",
+    "docs/musubi_m_4_third_party_app_platform_plan.md",
+    "docs/guides/create-third-party-app.md",
+    "migrations/006_third_party_app_platform_m4.sql",
   ]) {
     if (!(await Bun.file(file).exists())) throw new Error(`missing ${file}`);
   }
