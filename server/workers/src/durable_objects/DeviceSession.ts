@@ -1783,6 +1783,7 @@ export class DeviceSession {
           order by created_at desc
           limit 50
         `,
+        local_policy: defaultLocalPolicyView(),
       });
     }
     const device = await this.getMapItem<DeviceRecord>("devices", deviceId);
@@ -1791,7 +1792,23 @@ export class DeviceSession {
     const active_key = (await this.list<DeviceKeyRecord>("device_keys")).find(
       (key) => key.device_id === device.id && key.status === "active",
     );
-    return Response.json({ device: { ...device, status }, active_key });
+    return Response.json({
+      device: { ...device, status },
+      active_key,
+      capabilities: (await this.list<DevicePluginCapabilityRecord>("device_plugin_capabilities"))
+        .filter((capability) => capability.device_id === device.id)
+        .sort((a, b) => `${b.reported_at}:${b.id}`.localeCompare(`${a.reported_at}:${a.id}`)),
+      grants: (await this.list<GrantRecord>("grants")).filter((grant) => grant.device_id === device.id),
+      recent_messages: (await this.list<StoredMessage>("messages"))
+        .filter((item) => item.envelope.device_id === device.id)
+        .sort((a, b) => (b.envelope.created_at ?? "").localeCompare(a.envelope.created_at ?? ""))
+        .slice(0, 20),
+      recent_audit_events: (await this.list<AuditEventRecord>("audit_events"))
+        .filter((event) => event.device_id === device.id)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))
+        .slice(0, 50),
+      local_policy: defaultLocalPolicyView(),
+    });
   }
 
   private async handleCreateMessage(request: Request): Promise<Response> {
@@ -3579,6 +3596,14 @@ function messageCryptoView(row: any) {
     sender_key_id: crypto.sender_key_id ?? "",
     recipient_key_id: crypto.recipient_key_id ?? "",
     payload_size: crypto.payload_size ?? ciphertext.length,
+  };
+}
+
+function defaultLocalPolicyView() {
+  return {
+    status: "not_reported",
+    default_behavior: "deny by default",
+    copy: "Cloud grants allow an app to ask. Local policy on this machine still decides whether the request can run.",
   };
 }
 

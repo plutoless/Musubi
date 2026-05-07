@@ -223,6 +223,11 @@ function renderDevices() {
 function renderDevice(id) {
   setHeader("Device Detail", "Inspect capabilities, authorized apps, local policy context, messages, and audit.");
   const detail = state.data.deviceDetail;
+  const localPolicy = detail.local_policy || defaultLocalPolicy();
+  const capabilities = detail.capabilities || [];
+  const grants = detail.grants || [];
+  const recentMessages = detail.recent_messages || [];
+  const recentAuditEvents = detail.recent_audit_events || [];
   root.innerHTML = `
     <section class="detail-layout">
       <div class="detail-main">
@@ -239,17 +244,17 @@ function renderDevice(id) {
           </div>
           <p class="notice inline">This device keeps its private key locally. Musubi stores only its public key.</p>
         `)}
-        ${panel("Capabilities", detail.capabilities.length ? detail.capabilities.map(capabilityCard).join("") : empty("No capabilities reported yet."))}
-        ${panel("Authorized Apps", grantTable(detail.grants), "table-panel")}
-        ${panel("Recent Messages", messageTable(detail.recent_messages), "table-panel")}
-        ${panel("Audit", auditTable(detail.recent_audit_events), "table-panel")}
+        ${panel("Capabilities", capabilities.length ? capabilities.map(capabilityCard).join("") : empty("No capabilities reported yet."))}
+        ${panel("Authorized Apps", grantTable(grants), "table-panel")}
+        ${panel("Recent Messages", messageTable(recentMessages), "table-panel")}
+        ${panel("Audit", auditTable(recentAuditEvents), "table-panel")}
       </div>
       <aside class="detail-rail">
         ${panel("Local Policy", `
-          <p class="muted">${escapeHtml(detail.local_policy.copy)}</p>
+          <p class="muted">${escapeHtml(localPolicy.copy)}</p>
           <div class="rail-kv">
-            ${kvItem("Default behavior", detail.local_policy.default_behavior)}
-            ${kvItem("Policy report", detail.local_policy.status)}
+            ${kvItem("Default behavior", localPolicy.default_behavior)}
+            ${kvItem("Policy report", localPolicy.status)}
           </div>
         `)}
         ${panel("Danger Zone", `
@@ -451,6 +456,14 @@ function defaultPluginPolicy() {
     require_signature: true,
     allowed_trust_levels: ["official", "verified"],
     blocked_plugins: [],
+  };
+}
+
+function defaultLocalPolicy() {
+  return {
+    status: "not_reported",
+    default_behavior: "deny by default",
+    copy: "Cloud grants allow an app to ask. Local policy on this machine still decides whether the request can run.",
   };
 }
 
