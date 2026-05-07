@@ -8,19 +8,24 @@ import {
   assertPluginDetail,
   assertPluginPolicy,
 } from "./api_contract_assertions.ts";
+import { loadEnvFiles, requireHostedLocalNeon } from "./env.ts";
+
+loadEnvFiles();
+const databaseUrl = requireHostedLocalNeon("verify:slice11:local");
 
 const port = String(29000 + Math.floor(Math.random() * 1000));
 const serverUrl = `http://127.0.0.1:${port}`;
 const home = `${process.cwd()}/.musubi/slice11-hosted-local`;
 const wranglerEnv = {
   ...process.env,
+  NEON_DATABASE_URL: databaseUrl,
   TMPDIR: `${process.cwd()}/.cache/tmp`,
   BUN_INSTALL_CACHE_DIR: `${process.cwd()}/.cache/bun`,
 };
 
 await rm(home, { recursive: true, force: true });
 
-const worker = spawn("bunx", ["wrangler", "dev", "--ip", "127.0.0.1", "--port", port], {
+const worker = spawn("bunx", ["wrangler", "dev", "--ip", "127.0.0.1", "--port", port, "--var", `NEON_DATABASE_URL:${databaseUrl}`], {
   cwd: `${process.cwd()}/server/workers`,
   env: wranglerEnv,
   stdio: ["ignore", "pipe", "pipe"],

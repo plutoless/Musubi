@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { neon } from "@neondatabase/serverless";
 import { MusubiApp, createNativeAuthorization, exchangeNativeAuthorizationCode, generateX25519KeyPair, hermesPayload } from "../sdk/app-js/src/index.ts";
-import { loadEnvFiles } from "./env.ts";
+import { loadEnvFiles, requireHostedLocalNeon } from "./env.ts";
 import {
   assertApiKeyList,
   assertAppDetail,
@@ -23,9 +23,7 @@ const sql = databaseUrl ? neon(databaseUrl) : undefined;
 let adminCookie = "";
 
 if (import.meta.main) {
-  if (!databaseUrl) {
-    throw new Error("NEON_DATABASE_URL is required for verify:m4-hosted-local. Set it in the shell or in .env.local; see .env.example.");
-  }
+  requireHostedLocalNeon("verify:m4-hosted-local");
   await run("bun", ["run", "db:migrate:neon"]);
 
   let worker = startWorker();
@@ -105,7 +103,8 @@ async function waitForHealth() {
 
 export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
   if (!databaseUrl || !sql) {
-    throw new Error("NEON_DATABASE_URL is required for hosted M4 verification. Set it in the shell or in .env.local; see .env.example.");
+    requireHostedLocalNeon("verify:m4-hosted-local");
+    throw new Error("hosted M4 verification could not initialize Neon SQL client");
   }
   const unauthAdmin = await postJsonWithoutAdmin(`${apiBaseUrl}/v1/apps`, {
     workspace_id: workspace,

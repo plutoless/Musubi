@@ -170,41 +170,80 @@ If Go needs a writable build cache in a restricted environment, use:
 GOCACHE="$PWD/.cache/go-build" go test ./...
 ```
 
+### Test Pyramid
+
+Musubi verification is split into three explicit tiers:
+
+- `unit`: fast deterministic checks with no network, Wrangler, Neon, or deployed services
+- `local integration`: local relay, local CLI/plugin flows, browser/control-plane rendering, and SDK flows with no remote dependency
+- `hosted E2E`: a small deployed smoke tier only; broader deployed suites remain available but are not part of the minimum core gate
+
+Core CI is intentionally remote-free:
+
+```bash
+bun run test:ci:core
+```
+
+That expands to:
+
+```bash
+GOCACHE="$PWD/.cache/go-build" go test ./...
+bun run test:unit
+bun run test:integration:local
+```
+
+Hosted-local verification is a secondary tier that requires Neon and `wrangler dev`:
+
+```bash
+NEON_DATABASE_URL="<postgres-url>" bun run test:integration:hosted-local
+```
+
+Minimum deployed smoke coverage stays small and stable:
+
+```bash
+MUSUBI_HOSTED_URL="https://<worker-host>" \
+NEON_DATABASE_URL="<postgres-url>" \
+CONTROL_PLANE_BASIC_AUTH="<username:password>" \
+bun run test:e2e:remote
+```
+
 ### M1 Verification
 
-Run the M1 contract and slice verifiers:
+Run the remote-free core gate:
 
 ```bash
-bun run verify:m1-contracts
-bun run verify:slice1
-bun run verify:slice2
-bun run verify:slice3
-bun run verify:slice4
-bun run verify:slice5
-bun run verify:slice6
-bun run verify:slice7
-bun run verify:slice8
-bun run verify:slice9
-bun run verify:slice10
-bun run verify:slice10:hermes
-bun run verify:slice11
+bun run test:ci:core
+```
+
+Run the explicit unit tier:
+
+```bash
+bun run test:unit
+```
+
+Run the explicit local integration tier:
+
+```bash
+bun run test:integration:local
+```
+
+The unit tier covers contract assertions, readiness checks, and pure helper logic. The local integration tier covers architecture contracts, plugin dispatch, device registration, app creation, grants, signed WebSocket connect, public-key encrypted echo, message/audit lifecycle, local policy denial, Hermes native consent, Codex flows, control-plane rendering, and configurable runtime command seams.
+
+Hosted Cloudflare Worker/Durable Object verification is a separate hosted-local tier. It is not part of the core gate because it depends on `wrangler dev` and Neon. The hosted-local verifier starts `wrangler dev`, registers a Go CLI device, records plugin capabilities, sends an encrypted Hermes task through the Worker/Durable Object path, verifies reconnect behavior, and checks lifecycle audit metadata:
+
+```bash
+NEON_DATABASE_URL="<postgres-url>" bun run test:integration:hosted-local
+```
+
+The underlying hosted-local commands remain available when you want to run individual checks:
+
+```bash
 bun run verify:slice11:build
-bun run verify:slice11:local
-bun run verify:slice12
-bun run verify:slice12:runtime
-bun run verify:slice13
-bun run verify:m1-readiness
+NEON_DATABASE_URL="<postgres-url>" bun run verify:slice11:local
+NEON_DATABASE_URL="<postgres-url>" bun run verify:m4-hosted-local
 ```
 
-The local M1 implementation covers architecture contracts, plugin dispatch, device registration, app creation, grants, signed WebSocket connect, public-key encrypted echo, message/audit lifecycle, local policy denial, Hermes plugin skeleton, and a configurable Hermes runtime command seam.
-
-Hosted Cloudflare Worker/Durable Object implementation is present under `server/workers/`. The local hosted-runtime verifier starts `wrangler dev`, registers a Go CLI device, records plugin capabilities, sends an encrypted Hermes task through the Worker/Durable Object path, verifies reconnect behavior, and checks lifecycle audit metadata:
-
-```bash
-bun run verify:slice11:local
-```
-
-For a deployed hosted run, apply Neon migrations, configure the Worker secret, deploy, then run the deployed verifier:
+For a deployed hosted run, apply Neon migrations, configure the Worker secret, deploy, then run the minimum remote smoke suite:
 
 ```bash
 NEON_DATABASE_URL="<postgres-url>" bun run db:migrate:neon
@@ -216,7 +255,24 @@ TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler
 cd ../..
 MUSUBI_HOSTED_URL="https://<worker-host>" \
 NEON_DATABASE_URL="<postgres-url>" \
+CONTROL_PLANE_BASIC_AUTH="<username:password>" \
+bun run test:e2e:remote
+```
+
+The minimum remote gate covers:
+
+- one deployed encrypted task happy path via `verify:slice12:deployed`
+- one deployed denial/policy path via `verify:m4-hosted-deployed`
+- one deployed control-plane availability/auth smoke via `verify:control-plane:deployed`
+
+Broader deployed suites remain available for deeper staging checks:
+
+```bash
 bun run verify:slice11:deployed
+bun run verify:slice12:deployed
+bun run verify:slice13:deployed
+bun run verify:m4-hosted-deployed
+bun run verify:control-plane:deployed
 ```
 
 A real hosted deployment still requires Cloudflare authentication and Neon configuration.

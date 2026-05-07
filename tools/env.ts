@@ -20,6 +20,19 @@ export function loadEnvFiles(paths = [".env.local", ".env"]) {
   return loaded;
 }
 
+export function requireEnv(name: string, message?: string) {
+  const value = process.env[name];
+  if (value !== undefined && value !== "") return value;
+  throw new Error(message ?? `${name} is required.`);
+}
+
+export function requireHostedLocalNeon(scriptName: string) {
+  return requireEnv(
+    "NEON_DATABASE_URL",
+    `NEON_DATABASE_URL is required for ${scriptName}. Hosted-local verification is a secondary CI tier and needs a real Neon database URL in the shell or .env.local; see .env.example.`,
+  );
+}
+
 function unquoteEnvValue(value: string) {
   if (
     (value.startsWith('"') && value.endsWith('"')) ||
