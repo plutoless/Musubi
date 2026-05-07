@@ -47,9 +47,9 @@ try {
   await waitForHealth();
 
   const deviceOutput = await run("go", ["run", "./cmd/musubi", "device", "register", "--server", serverUrl, "--home", home, "--workspace", "ws_hosted_local"]);
-  const deviceId = requiredMatch(deviceOutput, /registered device (dev_\d+)/, "device id");
+  const deviceId = requiredMatch(deviceOutput, /(dev_[a-z0-9]+)/, "device id");
   const appOutput = await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Hermes Web", "--server", serverUrl, "--home", home, "--workspace", "ws_hosted_local"]);
-  const appId = requiredMatch(appOutput, /created app (app_\d+)/, "app id");
+  const appId = requiredMatch(appOutput, /(app_[a-z0-9]+)/, "app id");
   await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: "ws_hosted_local",
     app_id: appId,
