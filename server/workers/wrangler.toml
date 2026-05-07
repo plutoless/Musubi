@@ -6,6 +6,7 @@ compatibility_date = "2026-05-06"
 directory = "../../apps/control-plane"
 binding = "ASSETS"
 run_worker_first = true
+html_handling = "none"
 
 [[durable_objects.bindings]]
 name = "DEVICE_SESSION"
