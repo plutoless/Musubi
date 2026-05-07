@@ -2,15 +2,47 @@ const state = {
   route: location.hash.replace("#", "") || "home",
   data: emptyData(),
   createdApiKey: null,
+  admin: null,
+  user: null,
+  deviceRegistrationToken: null,
   pagination: {},
   messageFilters: { app_id: "", device_id: "", status: "", channel: "" },
   auditFilters: { event_type: "", app_id: "", device_id: "" },
 };
 
-const title = document.querySelector("#page-title");
-const copy = document.querySelector("#page-copy");
-const root = document.querySelector("#app");
-const refresh = document.querySelector("#refresh");
+const mount = document.querySelector("#app-root");
+let title = null;
+let copy = null;
+let root = null;
+let refresh = null;
+let nav = null;
+let layout = null;
+const mode = location.pathname.includes("/admin") ? "admin" : "user";
+const modeBase = mode === "admin" ? "/control-plane/admin" : "/control-plane/user";
+if (location.pathname === "/control-plane" || location.pathname === "/control-plane/") {
+  location.replace(modeBase);
+}
+const navItems = mode === "admin"
+  ? [
+      ["home", "Admin Home"],
+      ["apps", "Apps"],
+      ["developer", "Developer"],
+      ["users", "Users"],
+      ["plugins", "Plugins"],
+      ["messages", "Messages"],
+      ["audit", "Audit"],
+      ["settings", "Settings"],
+    ]
+  : [
+      ["home", "Home"],
+      ["setup/hermes", "Setup"],
+      ["devices", "Devices"],
+      ["apps/authorized", "Authorized Apps"],
+      ["plugins", "Plugins"],
+      ["messages", "Messages"],
+      ["audit", "Audit"],
+      ["settings", "Settings"],
+    ];
 const PAGINATED_ROUTE_KEYS = [
   "devices",
   "apps",
@@ -18,14 +50,18 @@ const PAGINATED_ROUTE_KEYS = [
   "apps.capabilities",
   "developerApps",
   "authorizedApps",
+  "users",
   "plugins",
   "messages",
   "audit",
   "home.messages",
   "home.audit",
+  "setup.devices",
+  "setup.apps",
+  "setup.grants",
+  "setup.capabilities",
 ];
 
-refresh.addEventListener("click", () => load());
 window.addEventListener("hashchange", () => {
   const nextRoute = location.hash.replace("#", "") || "home";
   if (state.route !== nextRoute) resetAllPagination();
@@ -35,21 +71,113 @@ window.addEventListener("hashchange", () => {
 
 load();
 
+function ensureAuthShell() {
+  if (layout === "auth") return;
+  layout = "auth";
+  mount.innerHTML = `
+    <main class="auth-shell">
+      <section class="auth-card">
+        <div class="auth-brand">
+          <strong>Musubi</strong>
+          <span>${mode === "admin" ? "Admin Control Plane" : "User Control Plane"}</span>
+        </div>
+        <header class="auth-header">
+          <h1 id="page-title">Sign in</h1>
+          <p id="page-copy">Musubi routes encrypted messages but cannot read task contents.</p>
+        </header>
+        <section id="app" class="auth-content" aria-live="polite"></section>
+      </section>
+    </main>
+  `;
+  bindShellElements();
+}
+
+function ensureAppShell() {
+  if (layout === "app") return;
+  layout = "app";
+  mount.innerHTML = `
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <strong>Musubi</strong>
+          <span>Control Plane</span>
+        </div>
+        <nav id="primary-nav" aria-label="Primary"></nav>
+      </aside>
+      <main>
+        <header class="topbar">
+          <div>
+            <h1 id="page-title">Home</h1>
+            <p id="page-copy">Musubi routes encrypted messages but cannot read task contents.</p>
+          </div>
+          <button id="refresh" type="button" title="Refresh">Refresh</button>
+        </header>
+        <section id="app" class="content" aria-live="polite"></section>
+      </main>
+    </div>
+  `;
+  bindShellElements();
+  nav.innerHTML = navItems.map(([route, label]) => `<a href="#${route}" data-route="${route}">${label}</a>`).join("");
+  refresh.addEventListener("click", () => load());
+}
+
+function bindShellElements() {
+  title = document.querySelector("#page-title");
+  copy = document.querySelector("#page-copy");
+  root = document.querySelector("#app");
+  refresh = document.querySelector("#refresh");
+  nav = document.querySelector("#primary-nav");
+}
+
 async function load() {
-  markActive();
-  root.innerHTML = `<div class="panel loading-state">Loading...</div>`;
   try {
+    if (state.route === "login") {
+      return mode === "admin" ? renderAdminLogin() : renderUserLogin();
+    }
+    if (mode === "admin") {
+      state.admin = await currentAdmin();
+      if (!state.admin) return renderAdminLogin();
+    } else {
+      state.user = await currentUser();
+      if (!state.user) {
+        return renderUserLogin();
+      }
+    }
+    ensureAppShell();
+    markActive();
+    root.innerHTML = `<div class="panel loading-state">Loading...</div>`;
     state.data = { ...emptyData(), ...(await loadRouteData()) };
     await render();
     bindPaginationControls();
   } catch (error) {
+    if (error.status === 401) {
+      return mode === "admin" ? renderAdminLogin() : renderUserLogin();
+    }
+    ensureAppShell();
     root.innerHTML = `<div class="panel error-state">Control plane data failed to load: ${escapeHtml(error.message)}</div>`;
   }
 }
 
 async function loadRouteData() {
   const [name, id] = state.route.split("/");
+  if (mode === "user" && (state.route === "apps/new" || name === "apps" && id !== "authorized" || name === "developer" || name === "users")) {
+    location.hash = "apps/authorized";
+    return {};
+  }
+  if (mode === "admin" && (state.route === "setup/hermes" || state.route === "apps/authorized" || name === "consent")) {
+    location.hash = "home";
+    return {};
+  }
   if (state.route === "apps/new" || name === "settings") return {};
+  if (state.route === "setup/hermes") {
+    const [devices, apps, grants, capabilities] = await Promise.all([
+      pagedApi("/v1/devices", "setup.devices"),
+      pagedApi("/v1/apps", "setup.apps"),
+      pagedApi("/v1/grants", "setup.grants"),
+      pagedApi("/v1/device-plugin-capabilities", "setup.capabilities"),
+    ]);
+    return { devices, apps, grants, capabilities };
+  }
   if (state.route === "apps/authorized") return { authorizedApps: await pagedApi("/v1/authorized-apps", "authorizedApps") };
   if (name === "consent" && id) return { consentDetail: await api(`/v1/consent-requests/${id}`) };
   if (name === "plugins" && id) return { pluginDetail: await api(`/v1/plugins/${id}`) };
@@ -66,6 +194,7 @@ async function loadRouteData() {
     return { apps, devices, capabilities };
   }
   if (name === "developer") return { apps: await pagedApi("/v1/apps", "developerApps") };
+  if (name === "users") return { users: await pagedApi("/v1/users", "users") };
   if (name === "plugins") {
     const [plugins, pluginPolicy] = await Promise.all([
       pagedApi("/v1/plugins", "plugins"),
@@ -124,6 +253,8 @@ function emptyData() {
     audit: { audit_events: [] },
     capabilities: { capabilities: [] },
     authorizedApps: { authorized_apps: [], apps: [] },
+    users: { users: [] },
+    grants: { grants: [] },
     plugins: { plugins: [] },
     pluginPolicy: { policy: defaultPluginPolicy() },
     consentDetail: null,
@@ -136,18 +267,45 @@ function emptyData() {
 
 async function api(path, options) {
   const response = await fetch(path, {
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     ...options,
   });
   const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(json.error || `${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    const error = new Error(json.error || `${response.status} ${response.statusText}`);
+    error.status = response.status;
+    throw error;
+  }
   return json;
+}
+
+async function currentAdmin() {
+  try {
+    const result = await api("/v1/admin/me");
+    return result.admin;
+  } catch (error) {
+    if (error.status === 401) return null;
+    throw error;
+  }
+}
+
+async function currentUser() {
+  try {
+    const result = await api("/v1/user/me");
+    return result.user;
+  } catch (error) {
+    if (error.status === 401) return null;
+    throw error;
+  }
 }
 
 async function render() {
   const [name, id] = state.route.split("/");
+  if (state.route === "login") return mode === "admin" ? renderAdminLogin() : renderUserLogin();
   if (state.route === "apps/new") return renderNewApp();
   if (state.route === "apps/authorized") return renderAuthorizedApps();
+  if (state.route === "setup/hermes") return renderHermesSetup();
   if (name === "consent" && id) return renderConsent(id);
   if (name === "plugins" && id) return renderPlugin(id);
   if (name === "devices" && id) return renderDevice(id);
@@ -156,6 +314,7 @@ async function render() {
   if (name === "devices") return renderDevices();
   if (name === "apps") return renderApps();
   if (name === "developer") return renderDeveloper();
+  if (name === "users") return renderUsers();
   if (name === "plugins") return renderPlugins();
   if (name === "messages") return renderMessages();
   if (name === "audit") return renderAudit();
@@ -195,8 +354,9 @@ function renderHome() {
         <pre>go run ./cmd/musubi device register --server ${location.origin} --home .musubi/m2</pre>
         <div class="toolbar">
           <button class="primary" data-copy="go run ./cmd/musubi device register --server ${location.origin} --home .musubi/m2">Copy register command</button>
+          ${mode === "user" ? `<button onclick="location.hash='setup/hermes'">Hermes setup</button>` : ""}
           <button onclick="location.hash='devices'">View devices</button>
-          <button onclick="location.hash='apps'">View apps</button>
+          <button onclick="location.hash='${mode === "admin" ? "apps" : "apps/authorized"}'">View apps</button>
         </div>
       `, "span-5")}
       ${panel("Recent Messages", messageTable(messages.slice(0, 6)), "span-7")}
@@ -205,11 +365,172 @@ function renderHome() {
   bindCopy();
 }
 
+function renderAdminLogin() {
+  ensureAuthShell();
+  setHeader("Admin Login", "Sign in to manage apps and workspace policy.");
+  root.innerHTML = `
+    <section class="login-layout">
+      ${panel("Admin", `
+        <form id="admin-login" class="form-grid">
+          <label>Username<input id="admin-username" autocomplete="username" value="admin" /></label>
+          <label>Password<input id="admin-password" type="password" autocomplete="current-password" /></label>
+          <button class="primary" type="submit">Sign in</button>
+        </form>
+        <p class="muted">Admin sessions are stored in an HttpOnly SameSite cookie. App runtime credentials cannot manage control-plane resources.</p>
+      `)}
+    </section>
+  `;
+  document.querySelector("#admin-login")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await api("/v1/admin/login", {
+      method: "POST",
+      body: JSON.stringify({
+        username: document.querySelector("#admin-username").value,
+        password: document.querySelector("#admin-password").value,
+      }),
+    });
+    const targetRoute = state.route === "login" ? "home" : state.route;
+    state.route = targetRoute;
+    location.hash = targetRoute;
+    load();
+  });
+}
+
+function renderUserLogin() {
+  ensureAuthShell();
+  setHeader("User Login", "Sign in to manage your devices and app approvals.");
+  root.innerHTML = `
+    <section class="login-layout">
+      ${panel("Sign in", `
+        <form id="user-login" class="form-grid">
+          <label>Email<input id="user-email" autocomplete="email" value="user@example.test" /></label>
+          <label>Password<input id="user-password" type="password" autocomplete="current-password" /></label>
+          <button class="primary" type="submit">Sign in</button>
+        </form>
+      `)}
+      ${panel("Create account", `
+        <form id="user-signup" class="form-grid">
+          <label>Name<input id="signup-name" autocomplete="name" value="Local User" /></label>
+          <label>Email<input id="signup-email" autocomplete="email" value="user@example.test" /></label>
+          <label>Password<input id="signup-password" type="password" autocomplete="new-password" placeholder="At least 8 characters" /></label>
+          <button type="submit">Create account</button>
+        </form>
+        <p class="muted">User sessions are stored in an HttpOnly SameSite cookie and scope device approvals to your account.</p>
+      `)}
+    </section>
+  `;
+  document.querySelector("#user-login")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await api("/v1/user/login", {
+      method: "POST",
+      body: JSON.stringify({
+        email: document.querySelector("#user-email").value,
+        password: document.querySelector("#user-password").value,
+        workspace_id: "ws_local",
+      }),
+    });
+    const targetRoute = state.route === "login" ? "home" : state.route;
+    state.route = targetRoute;
+    location.hash = targetRoute;
+    load();
+  });
+  document.querySelector("#user-signup")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await api("/v1/user/signup", {
+      method: "POST",
+      body: JSON.stringify({
+        name: document.querySelector("#signup-name").value,
+        email: document.querySelector("#signup-email").value,
+        password: document.querySelector("#signup-password").value,
+        workspace_id: "ws_local",
+      }),
+    });
+    const targetRoute = state.route === "login" ? "home" : state.route;
+    state.route = targetRoute;
+    location.hash = targetRoute;
+    load();
+  });
+}
+
+function renderHermesSetup() {
+  setHeader("Hermes Setup", "Register a Mac, then approve Hermes Companion in Musubi.");
+  const server = location.origin;
+  const channels = ["hermes.task.create", "hermes.task.cancel", "hermes.task.status"];
+  const devices = state.data.devices.devices || [];
+  const apps = state.data.apps.apps || [];
+  const grants = state.data.grants.grants || [];
+  const capabilities = state.data.capabilities.capabilities || [];
+  const hermesDevices = devices.filter((device) =>
+    capabilities.some((capability) => capability.device_id === device.id && capability.plugin_name === "hermes")
+  );
+  const selectedDevice = hermesDevices.find((device) => device.status === "online") || hermesDevices[0] || devices.find((device) => device.status !== "revoked") || devices[0];
+  const hermesApps = apps.filter((app) => app.name === "Hermes Companion");
+  const selectedApp = hermesApps.find((app) => app.status === "active");
+  const activeGrant = selectedApp && selectedDevice
+    ? grants.find((grant) =>
+      grant.app_id === selectedApp.id &&
+      grant.device_id === selectedDevice.id &&
+      grant.status === "active" &&
+      channels.every((channel) => grant.allowed_channels.includes(channel))
+    )
+    : null;
+  const token = state.deviceRegistrationToken?.registration_token || "<generate-token-first>";
+  const registerCommand = `HERMES_COMMAND="/path/to/hermes" go run ./cmd/musubi device register --server ${server} --home ~/.musubi/hermes-device --workspace ws_local --name "Hermes Mac" --registration-token ${token} --start`;
+  const setupComplete = Boolean(selectedDevice && hermesDevices.includes(selectedDevice) && selectedApp && activeGrant);
+
+  root.innerHTML = `
+    <section class="notice">Run setup on the Mac that will execute Hermes work. Device registration creates only local device keys; Hermes Companion signs in separately and asks you to approve device access in Musubi.</section>
+    <section class="setup-grid">
+      ${panel("1. Register This Mac", `
+        <p class="muted">Registers this device, reports local capabilities, and starts the Musubi device service. It does not create a Hermes app API key.</p>
+        <pre>${escapeHtml(registerCommand)}</pre>
+        <div class="toolbar">
+          <button id="generate-device-token">Generate registration token</button>
+          <button class="primary" data-copy="${escapeHtml(registerCommand)}">Copy register command</button>
+        </div>
+        <p class="muted">${state.deviceRegistrationToken ? `Token expires at ${fmt(state.deviceRegistrationToken.expires_at)}.` : "Generate a token before copying the command."}</p>
+      `, "span-7")}
+      ${panel("Status", `
+        <div class="kv-grid">
+          ${kvItem("Registered device", selectedDevice ? `${selectedDevice.name || selectedDevice.id} (${selectedDevice.status})` : "pending")}
+          ${kvItem("Device online", selectedDevice?.status === "online" ? "online" : "pending")}
+          ${kvItem("Hermes capability", selectedDevice && hermesDevices.includes(selectedDevice) ? "available" : "pending")}
+          ${kvItem("Hermes Companion authorized", selectedApp ? `${selectedApp.id}` : "pending")}
+          ${kvItem("Active grant", activeGrant ? activeGrant.id : "pending")}
+          ${kvItem("Setup", setupComplete ? "complete" : "pending")}
+        </div>
+        <div class="toolbar">
+          <button onclick="load()">Refresh</button>
+          <button onclick="location.hash='devices'">View devices</button>
+        </div>
+      `, "span-5")}
+    </section>
+    ${panel("2. Open Hermes Companion", `
+      <p class="muted">Hermes Companion is a separate native app. It opens Musubi in your browser, uses loopback PKCE, registers its public encryption key, and receives a short-lived session token after approval.</p>
+    `)}
+    ${panel("3. Approve Access In Musubi", `
+      <p class="muted">Review the device and Hermes channels, then approve. You can revoke access later from Authorized Apps.</p>
+      <div class="chips">${chips(channels)}</div>
+      <p class="notice inline">Native Hermes users do not copy app API keys, app private keys, app key ids, or SDK config paths.</p>
+      <p class="muted">Developer and third-party publisher setup remains on the Developer page for external apps.</p>
+    `)}
+  `;
+  bindCopy();
+  document.querySelector("#generate-device-token")?.addEventListener("click", async () => {
+    state.deviceRegistrationToken = await api("/v1/user/device-registration-tokens", {
+      method: "POST",
+      body: JSON.stringify({ workspace_id: "ws_local" }),
+    });
+    renderHermesSetup();
+  });
+}
+
 function renderDevices() {
   setHeader("Devices", "Registered machines and their reported local capabilities.");
   const devices = state.data.devices.devices;
   root.innerHTML = `
     <section class="notice">Apps do not access the whole machine. They can only request channels that are granted and allowed by local policy.</section>
+    ${mode === "user" ? `<section class="toolbar setup-link-strip"><button onclick="location.hash='setup/hermes'">Open Hermes setup</button></section>` : ""}
     <section class="metric-strip compact">
       ${metric("Registered", devices.length, "Total devices")}
       ${metric("Online", devices.filter((device) => device.status === "online").length, "Connected now")}
@@ -273,7 +594,7 @@ function renderApps() {
     <section class="detail-layout apps-layout">
       <div class="detail-main">
         ${panel("Apps", `
-          <div class="panel-tools"><button class="primary" onclick="location.hash='apps/new'">New user-owned app</button></div>
+          <div class="panel-tools"><button class="primary" onclick="location.hash='apps/new'">New user-owned app</button>${mode === "user" ? `<button onclick="location.hash='setup/hermes'">Hermes setup</button>` : ""}</div>
           ${appTable(state.data.apps.apps)}
           ${paginationControls("apps", state.data.apps)}
         `, "table-panel")}
@@ -306,12 +627,12 @@ function renderNewApp() {
         `)}
       </div>
       <aside class="detail-rail">
-        ${panel("SDK Environment", `
+        ${panel("Backend SDK Credentials", `
           <div class="rail-kv">
-            ${kvItem("MUSUBI_API_BASE_URL", server)}
-            ${kvItem("MUSUBI_APP_ID", "printed by CLI")}
-            ${kvItem("MUSUBI_API_KEY", "printed once")}
-            ${kvItem("MUSUBI_APP_PRIVATE_KEY", "stored locally")}
+            ${kvItem("API base URL", server)}
+            ${kvItem("App id", "printed by CLI")}
+            ${kvItem("Backend API key", "printed once")}
+            ${kvItem("Local app private key", "stored locally")}
           </div>
         `)}
       </aside>
@@ -361,25 +682,36 @@ curl -X POST ${server}/v1/developer/apps/app_001/permission-declarations -H 'Con
   bindCopy();
 }
 
+function renderUsers() {
+  setHeader("Users", "Normal user accounts and device ownership.");
+  const users = state.data.users.users || [];
+  root.innerHTML = `
+    <section class="notice">Users self-sign up in this version. Admins can inspect accounts but do not receive user passwords or session tokens.</section>
+    ${panel("Users", `${userTable(users)}${paginationControls("users", state.data.users)}`, "table-panel")}
+  `;
+}
+
 function renderConsent(id) {
-  setHeader("Consent", "Review app identity, publisher, requested permissions, and local device scope.");
+  if (mode === "user" && !state.user) return renderUserLogin();
+  setHeader("Consent", "Review app identity, requested permissions, and local device scope.");
   const detail = state.data.consentDetail;
   const app = detail.app;
   const request = detail.consent_request;
   const devices = detail.devices || [];
   const requestedChannels = request.requested_capabilities.flatMap((capability) => capability.channels);
+  const isNative = request.kind === "native_pkce";
   root.innerHTML = `
     <section class="detail-layout">
       <div class="detail-main">
         ${panel("", `
-          ${entityHeader(app.name, "Third-party app consent", badge(request.status))}
+          ${entityHeader(app.name, isNative ? "Native app consent" : "Third-party app consent", badge(request.status))}
           <div class="kv-grid">
             ${kvItem("App ID", app.id)}
-            ${kvItem("Publisher", app.publisher?.display_name || "Unverified publisher")}
+            ${kvItem("Publisher", app.publisher?.display_name || (isNative ? "First-party app" : "Unverified publisher"))}
             ${kvItem("Trust status", app.trust_status || "unverified")}
             ${kvItem("Review status", app.review_status || "not submitted")}
           </div>
-          <p class="notice inline">Payload encrypted end-to-end. Musubi routes requests but cannot read task contents; local policy on the selected device can still deny execution.</p>
+          <p class="notice inline">Payloads are encrypted end to end. Musubi routes requests but cannot read task contents; local policy on the selected device can still deny execution.</p>
         `)}
         ${panel("Requested Access", `
           <div class="permission-grid">
@@ -413,7 +745,7 @@ function renderConsent(id) {
   `;
   document.querySelector("#approve-consent")?.addEventListener("click", async () => {
     const allowed_channels = [...document.querySelectorAll(".checkboxes input:checked")].map((input) => input.value);
-    await api(`/v1/consent-requests/${id}/approve`, {
+    const approved = await api(`/v1/consent-requests/${id}/approve`, {
       method: "POST",
       body: JSON.stringify({
         device_id: document.querySelector("#consent-device").value,
@@ -421,17 +753,21 @@ function renderConsent(id) {
         queueing_allowed: document.querySelector("#consent-queueing").checked,
       }),
     });
+    if (approved.redirect_uri) {
+      location.href = approved.redirect_uri;
+      return;
+    }
     location.hash = "apps/authorized";
     load();
   });
 }
 
 function renderAuthorizedApps() {
-  setHeader("Authorized Apps", "Third-party app grants, publisher identity, reports, and revoke controls.");
+  setHeader("Authorized Apps", "Apps you have approved for your devices.");
   const rows = state.data.authorizedApps.authorized_apps || [];
   root.innerHTML = `
     <section class="notice">Authorized app grants can be revoked without deleting message or audit history.</section>
-    ${panel("Third-party Apps", `${authorizedAppTable(rows)}${paginationControls("authorizedApps", state.data.authorizedApps)}`, "table-panel")}
+    ${panel("Authorized Apps", `${authorizedAppTable(rows)}${paginationControls("authorizedApps", state.data.authorizedApps)}`, "table-panel")}
   `;
   bindActions();
 }
@@ -633,7 +969,7 @@ function renderAudit() {
 }
 
 function renderSettings() {
-  setHeader("Settings", "M2 keeps workspace ownership simple.");
+  setHeader("Settings", mode === "admin" ? "Workspace and admin session." : "Workspace and user session.");
   root.innerHTML = `
     ${panel("Workspace", `
       <div class="kv-grid">
@@ -642,7 +978,23 @@ function renderSettings() {
       </div>
       <p class="muted">M2 uses a single workspace owner model. Enterprise RBAC, SCIM, billing, and marketplace settings are intentionally out of scope.</p>
     `)}
+    ${panel(mode === "admin" ? "Admin Session" : "User Session", `
+      <div class="kv-grid">
+        ${kvItem("Status", (mode === "admin" ? state.admin : state.user) ? "signed in" : "signed out")}
+        ${mode === "admin" ? kvItem("Admin", state.admin?.username || "none") : kvItem("User", state.user?.email || "none")}
+      </div>
+      <div class="toolbar">
+        ${(mode === "admin" ? state.admin : state.user) ? `<button id="session-logout">Sign out</button>` : `<button onclick="location.hash='login'">Sign in</button>`}
+      </div>
+    `)}
   `;
+  document.querySelector("#session-logout")?.addEventListener("click", async () => {
+    await api(mode === "admin" ? "/v1/admin/logout" : "/v1/user/logout", { method: "POST" });
+    state.admin = null;
+    state.user = null;
+    location.hash = "login";
+    load();
+  });
 }
 
 function metric(label, value, meta = "") {
@@ -729,6 +1081,15 @@ function authorizedAppTable(rows) {
   ]));
 }
 
+function userTable(users) {
+  if (!users.length) return empty("No users have signed up yet.");
+  return table(["User", "Email", "Created At"], users.map((user) => [
+    resourceCell(user.name || user.email || user.id, user.id),
+    escapeHtml(user.email || ""),
+    timeCell(user.created_at),
+  ]));
+}
+
 function pluginTable(plugins) {
   if (!plugins.length) return empty("No registry plugins available.");
   return table(["Plugin", "Publisher", "Trust", "Signature", "Channels", "Permissions", "Actions"], plugins.map((plugin) => [
@@ -761,8 +1122,8 @@ function sdkQuickstart(detail) {
 const musubi = new MusubiApp({
   apiBaseUrl: "${server}",
   appId: "${appId}",
-  apiKey: process.env.MUSUBI_API_KEY!,
-  privateKey: process.env.MUSUBI_APP_PRIVATE_KEY!,
+  apiKey: process.env.BACKEND_ONLY_MUSUBI_KEY!,
+  privateKey: await loadLocalAppPrivateKey(),
   appKeyId: "${detail.active_key?.id || "appkey_001"}",
 });
 

@@ -47,3 +47,24 @@ Do not introduce the full structure before there is real code that needs it.
 - Add tests alongside code once implementation begins.
 - Keep docs updated when changing core terminology, trust boundaries, protocol behavior, or repo structure.
 
+## Planning and Goal-Forge Procedure
+
+For substantial product, architecture, security, auth, or multi-module refactors, do not jump directly into implementation.
+
+Use this procedure:
+
+1. Draft or update a plan/spec document under `docs/`.
+2. Capture the problem statement, target user model, product flow, refactoring goals, non-goals, security requirements, implementation slices, and draft acceptance criteria.
+3. Keep open questions explicit in the plan document.
+4. Discuss open questions with the user and record decisions in the document as they are made.
+5. Remove resolved items from the Open Decisions section.
+6. Do not compile to `GOAL.md` or start a long-running implementation until acceptance criteria are concrete and user-approved.
+7. When using `goal-forge`, treat the plan/spec as the source for `GOAL.md`, and ensure `done_when` names concrete commands, artifacts, or user-observable behaviors.
+
+Good planning behavior:
+
+- Prefer concrete tradeoffs over vague options.
+- Recommend a default when the tradeoff is engineering-driven.
+- Ask the user when the choice defines product intent.
+- Record explicit non-goals to prevent scope creep.
+- Keep security boundaries visible, especially around identity, grants, credentials, private keys, and server-blind payloads.

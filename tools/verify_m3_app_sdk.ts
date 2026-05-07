@@ -19,7 +19,9 @@ await assertArtifacts();
 
 const server = startRelay({ hostname: "127.0.0.1", port: Number(port) });
 let device: ReturnType<typeof spawn> | undefined;
+let adminCookie = "";
 try {
+  adminCookie = await adminLogin();
   await run("go", ["run", "./cmd/musubi", "device", "register", "--server", serverUrl, "--home", home, "--workspace", "ws_local", "--name", "M3 SDK Mac"]);
   const envOutput = await run("go", [
     "run",
@@ -80,14 +82,12 @@ try {
 
   const client = new MusubiApp({
     apiBaseUrl: serverUrl,
-    appId: sdkEnv.MUSUBI_APP_ID,
-    appKeyId: sdkEnv.MUSUBI_APP_KEY_ID,
     apiKey: sdkEnv.MUSUBI_API_KEY,
     privateKey: sdkEnv.MUSUBI_APP_PRIVATE_KEY,
-    workspaceId: "ws_local",
   });
   const devices = await client.devices.listGranted();
   if (devices.length !== 1 || devices[0].id !== "dev_001") throw new Error("SDK did not list granted device");
+  if (client.appId !== sdkEnv.MUSUBI_APP_ID) throw new Error("SDK did not infer app id from authenticated app context");
 
   const echoInvocation = await client.invoke({
     deviceId: "dev_001",
@@ -140,7 +140,6 @@ try {
   await postJson(`${serverUrl}/v1/apps/${sdkEnv.MUSUBI_APP_ID}/api-keys/${keyId}/revoke`, {});
   const revokedClient = new MusubiApp({
     apiBaseUrl: serverUrl,
-    appId: sdkEnv.MUSUBI_APP_ID,
     apiKey: sdkEnv.MUSUBI_API_KEY,
     privateKey: sdkEnv.MUSUBI_APP_PRIVATE_KEY,
   });
@@ -271,6 +270,18 @@ async function requestJson(url: string): Promise<any> {
   return JSON.parse(stdout);
 }
 
+async function adminLogin() {
+  const response = await fetch(`${serverUrl}/v1/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "admin", password: "musubi-admin-local" }),
+  });
+  if (!response.ok) throw new Error(`admin login failed: ${response.status} ${await response.text()}`);
+  const cookie = response.headers.get("set-cookie")?.split(";")[0];
+  if (!cookie) throw new Error("admin login did not return cookie");
+  return cookie;
+}
+
 async function postJson(url: string, body: unknown): Promise<any> {
   const response = await postJsonWithStatus(url, body);
   if (response.status < 200 || response.status >= 300) throw new Error(`POST ${url} failed: ${response.status} ${JSON.stringify(response.body)}`);
@@ -290,6 +301,7 @@ async function postJsonWithStatus(url: string, body: unknown, bearer?: string): 
     "Content-Type: application/json",
   ];
   if (bearer) args.push("-H", `Authorization: Bearer ${bearer}`);
+  if (adminCookie && !bearer) args.push("-H", `Cookie: ${adminCookie}`);
   args.push("--data-binary", JSON.stringify(body), url);
   const proc = Bun.spawn(["curl", ...args], { stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, exitCode] = await Promise.all([

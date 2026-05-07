@@ -44,6 +44,7 @@ var (
 	appResultKey     = mustHexKey("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
 	allowedChannels  = map[string]bool{"echo.echo": true, "echo.ping": true}
 	activeMusubiHome = ""
+	startDeviceLoop  = runStartCLI
 )
 
 type MessageEnvelope struct {
@@ -313,6 +314,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "hermes" {
+		if err := runHermesCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "status" {
 		if err := runStatusCLI(os.Args[2:]); err != nil {
 			log.Fatal(err)
@@ -327,6 +334,12 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "dev" {
 		if err := runDevCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "developer" {
+		if err := runDeveloperCLI(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -371,6 +384,193 @@ func main() {
 	}
 }
 
+func runDeveloperCLI(args []string) error {
+	if len(args) >= 2 && args[0] == "hermes" && args[1] == "setup" {
+		return runDeveloperHermesSetupCLI(args[2:])
+	}
+	return errors.New("usage: musubi developer hermes setup --server <url> --home <path> --workspace <id> --developer-name <name> --developer-email <email> --publisher-name <name> --app-name <name> [--env]")
+}
+
+var hermesDefaultChannels = []string{"hermes.task.create", "hermes.task.cancel", "hermes.task.status"}
+
+const hermesCompanionAppName = "Hermes Companion"
+
+func runDeveloperHermesSetupCLI(args []string) error {
+	flags := flag.NewFlagSet("developer hermes setup", flag.ContinueOnError)
+	serverURL := flags.String("server", "http://127.0.0.1:8787", "Musubi server URL")
+	home := flags.String("home", filepath.Join(defaultMusubiHome(), "hermes-companion"), "Musubi app home directory")
+	workspaceID := flags.String("workspace", "ws_local", "workspace ID")
+	developerName := flags.String("developer-name", "Local Hermes Developer", "developer display name")
+	developerEmail := flags.String("developer-email", "dev@example.test", "developer email")
+	publisherName := flags.String("publisher-name", "Local Hermes Publisher", "publisher display name")
+	appName := flags.String("app-name", "Hermes Companion", "third-party app name")
+	printEnv := flags.Bool("env", false, "print SDK environment variables")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*serverURL) == "" {
+		return errors.New("--server is required")
+	}
+
+	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	publicKey := privateKey.PublicKey()
+
+	setup, err := createHermesDeveloperSetup(*serverURL, *workspaceID, *developerName, *developerEmail, *publisherName, *appName, base64.StdEncoding.EncodeToString(publicKey.Bytes()))
+	if err != nil {
+		return err
+	}
+
+	appConfig := map[string]string{
+		"workspace_id":        *workspaceID,
+		"app_id":              setup.AppID,
+		"app_key_id":          setup.AppKeyID,
+		"app_api_key_id":      setup.APIKeyID,
+		"app_name":            *appName,
+		"server_url":          *serverURL,
+		"app_private_key":     base64.StdEncoding.EncodeToString(privateKey.Bytes()),
+		"app_public_key":      base64.StdEncoding.EncodeToString(publicKey.Bytes()),
+		"app_api_key":         setup.APIKey,
+		"developer_id":        setup.DeveloperID,
+		"publisher_id":        setup.PublisherID,
+		"permission_id":       setup.PermissionDeclarationID,
+		"consent_request_id":  setup.ConsentRequestID,
+		"consent_url":         setup.ConsentURL,
+		"server_key_scope":    "hermes-third-party-local",
+		"declared_channels":   strings.Join(hermesDefaultChannels, ","),
+		"queueing_requested":  "true",
+		"private_key_storage": "local-only",
+	}
+	if err := writeAppConfig(*home, setup.AppID, appConfig); err != nil {
+		return err
+	}
+
+	if *printEnv {
+		fmt.Printf("MUSUBI_API_BASE_URL=%s\n", *serverURL)
+		fmt.Printf("MUSUBI_APP_ID=%s\n", setup.AppID)
+		fmt.Printf("MUSUBI_APP_KEY_ID=%s\n", setup.AppKeyID)
+		fmt.Printf("MUSUBI_API_KEY=%s\n", setup.APIKey)
+		fmt.Printf("MUSUBI_APP_PRIVATE_KEY=%s\n", appConfig["app_private_key"])
+		fmt.Printf("MUSUBI_WORKSPACE_ID=%s\n", *workspaceID)
+		fmt.Printf("MUSUBI_CONSENT_URL=%s\n", setup.ConsentURL)
+		return nil
+	}
+	fmt.Printf("created Hermes third-party app %s with app key %s and api key %s\n", setup.AppID, setup.AppKeyID, setup.APIKeyID)
+	fmt.Printf("declared Hermes channels: %s\n", strings.Join(hermesDefaultChannels, ", "))
+	fmt.Printf("consent URL: %s\n", setup.ConsentURL)
+	fmt.Printf("app config written to %s\n", filepath.Join(*home, "apps", setup.AppID+".json"))
+	return nil
+}
+
+type hermesDeveloperSetup struct {
+	DeveloperID             string
+	PublisherID             string
+	AppID                   string
+	AppKeyID                string
+	APIKey                  string
+	APIKeyID                string
+	PermissionDeclarationID string
+	ConsentRequestID        string
+	ConsentURL              string
+}
+
+func createHermesDeveloperSetup(serverURL string, workspaceID string, developerName string, developerEmail string, publisherName string, appName string, publicKey string) (hermesDeveloperSetup, error) {
+	base := strings.TrimRight(serverURL, "/")
+	var developer struct {
+		Developer struct {
+			ID string `json:"id"`
+		} `json:"developer"`
+	}
+	if err := postJSON(base+"/v1/developers", map[string]interface{}{"name": developerName, "email": developerEmail}, &developer); err != nil {
+		return hermesDeveloperSetup{}, err
+	}
+
+	var publisher struct {
+		Publisher struct {
+			ID string `json:"id"`
+		} `json:"publisher"`
+	}
+	if err := postJSON(base+"/v1/publishers", map[string]interface{}{
+		"developer_id": developer.Developer.ID,
+		"display_name": publisherName,
+	}, &publisher); err != nil {
+		return hermesDeveloperSetup{}, err
+	}
+
+	var app struct {
+		AppID        string `json:"app_id"`
+		AppKeyID     string `json:"app_key_id"`
+		APIKey       string `json:"api_key"`
+		APIKeyRecord struct {
+			ID string `json:"id"`
+		} `json:"api_key_record"`
+	}
+	if err := postJSON(base+"/v1/developer/apps", map[string]interface{}{
+		"workspace_id":  workspaceID,
+		"name":          appName,
+		"publisher_id":  publisher.Publisher.ID,
+		"public_key":    publicKey,
+		"redirect_uris": []string{base + "/control-plane"},
+	}, &app); err != nil {
+		return hermesDeveloperSetup{}, err
+	}
+	if app.AppID == "" || app.AppKeyID == "" || app.APIKey == "" {
+		return hermesDeveloperSetup{}, errors.New("developer app response missing app id, app key id, or api key")
+	}
+
+	var declaration struct {
+		Declaration struct {
+			ID string `json:"id"`
+		} `json:"declaration"`
+	}
+	if err := postJSON(base+"/v1/developer/apps/"+app.AppID+"/permission-declarations", map[string]interface{}{
+		"plugin_name":        "hermes",
+		"channels":           hermesDefaultChannels,
+		"reason":             "Allow Hermes Companion to create, cancel, and read status for approved local Hermes tasks.",
+		"queueing_requested": true,
+	}, &declaration); err != nil {
+		return hermesDeveloperSetup{}, err
+	}
+
+	var consent struct {
+		ConsentRequestID string `json:"consent_request_id"`
+		ConsentURL       string `json:"consent_url"`
+		ConsentRequest   struct {
+			ID string `json:"id"`
+		} `json:"consent_request"`
+	}
+	if err := postJSON(base+"/v1/consent-requests", map[string]interface{}{
+		"app_id": app.AppID,
+		"state":  "hermes-local-setup",
+		"requested_capabilities": []map[string]interface{}{{
+			"plugin":   "hermes",
+			"channels": hermesDefaultChannels,
+			"reason":   "Allow Hermes Companion to invoke approved Hermes task channels on your selected Mac.",
+		}},
+	}, &consent); err != nil {
+		return hermesDeveloperSetup{}, err
+	}
+	consentID := consent.ConsentRequestID
+	if consentID == "" {
+		consentID = consent.ConsentRequest.ID
+	}
+	consentURL := absoluteControlPlaneURL(base, consent.ConsentURL)
+
+	return hermesDeveloperSetup{
+		DeveloperID:             developer.Developer.ID,
+		PublisherID:             publisher.Publisher.ID,
+		AppID:                   app.AppID,
+		AppKeyID:                app.AppKeyID,
+		APIKey:                  app.APIKey,
+		APIKeyID:                app.APIKeyRecord.ID,
+		PermissionDeclarationID: declaration.Declaration.ID,
+		ConsentRequestID:        consentID,
+		ConsentURL:              consentURL,
+	}, nil
+}
+
 func runDevCLI(args []string) error {
 	if len(args) >= 3 && args[0] == "echo" && args[1] == "send" {
 		return runDevEchoSend(args[2:])
@@ -398,25 +598,12 @@ func runDevCLI(args []string) error {
 		"type":         "first_party",
 		"public_key":   base64.StdEncoding.EncodeToString(publicKey.Bytes()),
 	}
-	body, err := json.Marshal(request)
-	if err != nil {
-		return err
-	}
-	resp, err := http.Post(strings.TrimRight(*serverURL, "/")+"/v1/apps", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		responseBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("create app failed: %s %s", resp.Status, string(responseBody))
-	}
 	var response struct {
 		AppID    string `json:"app_id"`
 		AppKeyID string `json:"app_key_id"`
 		Status   string `json:"status"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	if err := postJSON(strings.TrimRight(*serverURL, "/")+"/v1/apps", request, &response); err != nil {
 		return err
 	}
 
@@ -560,16 +747,257 @@ func createRelayAppAPIKey(serverURL string, appID string, name string) (createRe
 	return response, nil
 }
 
+type createRelayGrantResponse struct {
+	GrantID string `json:"grant_id"`
+	Status  string `json:"status"`
+	Grant   struct {
+		ID              string   `json:"id"`
+		AppID           string   `json:"app_id"`
+		DeviceID        string   `json:"device_id"`
+		AllowedChannels []string `json:"allowed_channels"`
+		Status          string   `json:"status"`
+	} `json:"grant"`
+}
+
+type localHermesSetup struct {
+	AppID         string
+	AppKeyID      string
+	APIKeyID      string
+	APIKey        string
+	AppPrivateKey string
+	AppPublicKey  string
+	GrantID       string
+	ConfigPath    string
+	PolicyPath    string
+	ServerURL     string
+	WorkspaceID   string
+	DeviceHome    string
+	DeviceID      string
+	StartCommand  string
+}
+
+func setupLocalHermesCompanion(serverURL string, home string, workspaceID string, config deviceConfig) (localHermesSetup, error) {
+	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return localHermesSetup{}, err
+	}
+	publicKey := privateKey.PublicKey()
+	appPrivateKey := base64.StdEncoding.EncodeToString(privateKey.Bytes())
+	appPublicKey := base64.StdEncoding.EncodeToString(publicKey.Bytes())
+
+	createResponse, err := createRelayApp(serverURL, workspaceID, hermesCompanionAppName, "user_owned", appPublicKey)
+	if err != nil {
+		return localHermesSetup{}, err
+	}
+	apiKeyResponse, err := createRelayAppAPIKey(serverURL, createResponse.AppID, "Hermes Companion local key")
+	if err != nil {
+		return localHermesSetup{}, err
+	}
+	grantResponse, err := createRelayGrant(serverURL, workspaceID, createResponse.AppID, config.DeviceID, hermesDefaultChannels)
+	if err != nil {
+		return localHermesSetup{}, err
+	}
+
+	appConfig := map[string]string{
+		"workspace_id":              workspaceID,
+		"app_id":                    createResponse.AppID,
+		"app_key_id":                createResponse.AppKeyID,
+		"app_api_key_id":            apiKeyResponse.Key.ID,
+		"app_name":                  hermesCompanionAppName,
+		"server_url":                serverURL,
+		"app_private_key":           appPrivateKey,
+		"app_public_key":            appPublicKey,
+		"app_api_key":               apiKeyResponse.APIKey,
+		"grant_id":                  grantResponse.GrantID,
+		"server_key_scope":          "hermes-user-owned-local",
+		"declared_channels":         strings.Join(hermesDefaultChannels, ","),
+		"private_key_storage":       "local-only",
+		"MUSUBI_API_BASE_URL":       serverURL,
+		"MUSUBI_APP_ID":             createResponse.AppID,
+		"MUSUBI_APP_KEY_ID":         createResponse.AppKeyID,
+		"MUSUBI_API_KEY":            apiKeyResponse.APIKey,
+		"MUSUBI_APP_PRIVATE_KEY":    appPrivateKey,
+		"MUSUBI_WORKSPACE_ID":       workspaceID,
+		"MUSUBI_HERMES_DEVICE_ID":   config.DeviceID,
+		"MUSUBI_HERMES_GRANT_ID":    grantResponse.GrantID,
+		"MUSUBI_HERMES_POLICY":      filepath.Join(home, "policy.yaml"),
+		"MUSUBI_HERMES_DEVICE_HOME": home,
+	}
+	if err := writeAppConfig(home, createResponse.AppID, appConfig); err != nil {
+		return localHermesSetup{}, err
+	}
+	if err := mergeHermesLocalPolicy(home, createResponse.AppID); err != nil {
+		return localHermesSetup{}, err
+	}
+
+	setup := localHermesSetup{
+		AppID:         createResponse.AppID,
+		AppKeyID:      createResponse.AppKeyID,
+		APIKeyID:      apiKeyResponse.Key.ID,
+		APIKey:        apiKeyResponse.APIKey,
+		AppPrivateKey: appPrivateKey,
+		AppPublicKey:  appPublicKey,
+		GrantID:       grantResponse.GrantID,
+		ConfigPath:    filepath.Join(home, "apps", createResponse.AppID+".json"),
+		PolicyPath:    filepath.Join(home, "policy.yaml"),
+		ServerURL:     serverURL,
+		WorkspaceID:   workspaceID,
+		DeviceHome:    home,
+		DeviceID:      config.DeviceID,
+	}
+	setup.StartCommand = fmt.Sprintf("go run ./cmd/musubi start --home %s", shellEnvQuote(home))
+	return setup, nil
+}
+
+func createRelayGrant(serverURL string, workspaceID string, appID string, deviceID string, channels []string) (createRelayGrantResponse, error) {
+	var response createRelayGrantResponse
+	if err := postJSON(strings.TrimRight(serverURL, "/")+"/v1/grants", map[string]interface{}{
+		"workspace_id":     workspaceID,
+		"app_id":           appID,
+		"device_id":        deviceID,
+		"allowed_channels": channels,
+		"queueing_allowed": true,
+		"name":             "Hermes Companion local grant",
+		"description":      "Allow the user-owned Hermes Companion app to invoke approved Hermes task channels on this device.",
+	}, &response); err != nil {
+		return createRelayGrantResponse{}, err
+	}
+	if response.GrantID == "" {
+		response.GrantID = response.Grant.ID
+	}
+	if response.GrantID == "" {
+		return createRelayGrantResponse{}, errors.New("grant response missing grant id")
+	}
+	return response, nil
+}
+
+func printLocalHermesSetup(setup localHermesSetup) {
+	fmt.Printf("created local Hermes Companion app %s with app key %s and api key %s\n", setup.AppID, setup.AppKeyID, setup.APIKeyID)
+	fmt.Printf("created active Hermes grant %s for device %s\n", setup.GrantID, setup.DeviceID)
+	fmt.Printf("MUSUBI_APP_ID=%s\n", setup.AppID)
+	fmt.Printf("MUSUBI_APP_KEY_ID=%s\n", setup.AppKeyID)
+	fmt.Printf("MUSUBI_API_KEY=%s\n", setup.APIKey)
+	fmt.Printf("MUSUBI_APP_PRIVATE_KEY=%s\n", setup.AppPrivateKey)
+	fmt.Printf("local app config written to %s\n", setup.ConfigPath)
+	fmt.Printf("local policy merged at %s\n", setup.PolicyPath)
+	fmt.Printf("configure your separate Hermes companion app with the SDK config at %s\n", setup.ConfigPath)
+	fmt.Printf("device start command:\n%s\n", setup.StartCommand)
+}
+
+func mergeHermesLocalPolicy(home string, appID string) error {
+	policyPath := filepath.Join(home, "policy.yaml")
+	policy := localPolicy{
+		Version: "m1",
+		Apps:    map[string]localPolicyApp{},
+		Plugins: map[string]localPolicyPlugin{},
+	}
+	if bytes, err := os.ReadFile(policyPath); err == nil && len(bytes) > 0 {
+		if err := yaml.Unmarshal(bytes, &policy); err != nil {
+			return err
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if policy.Version == "" {
+		policy.Version = "m1"
+	}
+	if policy.Version != "m1" {
+		return errors.New("unsupported policy version")
+	}
+	if policy.Apps == nil {
+		policy.Apps = map[string]localPolicyApp{}
+	}
+	if policy.Plugins == nil {
+		policy.Plugins = map[string]localPolicyPlugin{}
+	}
+
+	app := policy.Apps[appID]
+	if app.Name == "" {
+		app.Name = hermesCompanionAppName
+	}
+	if app.Plugins == nil {
+		app.Plugins = map[string]localPolicyAppPlugin{}
+	}
+	appHermes := app.Plugins["hermes"]
+	appHermes.Allow = mergeStringList(appHermes.Allow, hermesDefaultChannels)
+	appHermes.RequireLocalConfirm = false
+	if appHermes.MaxTaskDurationSeconds == 0 {
+		appHermes.MaxTaskDurationSeconds = 14400
+	}
+	app.Plugins["hermes"] = appHermes
+	policy.Apps[appID] = app
+
+	plugin := policy.Plugins["hermes"]
+	plugin.Enabled = true
+	plugin.Permissions = mergeStringList(plugin.Permissions, []string{"process.spawn", "fs.read.project", "fs.write.project", "network.outbound"})
+	policy.Plugins["hermes"] = plugin
+
+	if err := os.MkdirAll(home, 0700); err != nil {
+		return err
+	}
+	bytes, err := yaml.Marshal(policy)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(policyPath, bytes, 0600)
+}
+
+func mergeStringList(existing []string, additions []string) []string {
+	seen := map[string]bool{}
+	merged := make([]string, 0, len(existing)+len(additions))
+	for _, value := range existing {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		merged = append(merged, value)
+	}
+	for _, value := range additions {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		merged = append(merged, value)
+	}
+	return merged
+}
+
+func shellEnvQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if strings.ContainsAny(value, " \t\n'\"$`\\") {
+		return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+	}
+	return value
+}
+
 func postJSON(url string, request interface{}, response interface{}) error {
 	body, err := json.Marshal(request)
 	if err != nil {
 		return err
 	}
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := postJSONRequest(url, body, "")
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		responseBody, _ := io.ReadAll(resp.Body)
+		if strings.Contains(string(responseBody), "admin session required") {
+			cookie, loginErr := loginLocalAdmin(url)
+			if loginErr != nil {
+				return loginErr
+			}
+			resp, err = postJSONRequest(url, body, cookie)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+		} else {
+			return fmt.Errorf("post %s failed: %s %s", url, resp.Status, string(responseBody))
+		}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		responseBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("post %s failed: %s %s", url, resp.Status, string(responseBody))
@@ -578,6 +1006,54 @@ func postJSON(url string, request interface{}, response interface{}) error {
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(response)
+}
+
+func postJSONRequest(target string, body []byte, cookie string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+func loginLocalAdmin(target string) (string, error) {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return "", err
+	}
+	parsed.Path = "/v1/admin/login"
+	parsed.RawQuery = ""
+	username := os.Getenv("MUSUBI_ADMIN_USERNAME")
+	if username == "" {
+		username = "admin"
+	}
+	password := os.Getenv("MUSUBI_ADMIN_PASSWORD")
+	if password == "" {
+		password = "musubi-admin-local"
+	}
+	body, err := json.Marshal(map[string]string{"username": username, "password": password})
+	if err != nil {
+		return "", err
+	}
+	resp, err := postJSONRequest(parsed.String(), body, "")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	responseBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("admin login failed: %s %s", resp.Status, string(responseBody))
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "musubi_admin_session" {
+			return cookie.String(), nil
+		}
+	}
+	return "", errors.New("admin login did not return session cookie")
 }
 
 func runDevEchoSend(args []string) error {
@@ -732,13 +1208,16 @@ func runDevEchoSend(args []string) error {
 
 func runDeviceCLI(args []string) error {
 	if len(args) == 0 || args[0] != "register" {
-		return errors.New("usage: musubi device register --server <url> [--home <path>] [--workspace <id>] [--name <device name>]")
+		return errors.New("usage: musubi device register --server <url> [--home <path>] [--workspace <id>] [--name <device name>] [--registration-token <token>] [--start]")
 	}
 	flags := flag.NewFlagSet("device register", flag.ContinueOnError)
 	serverURL := flags.String("server", "http://127.0.0.1:8787", "Musubi server URL")
 	home := flags.String("home", defaultMusubiHome(), "Musubi home directory")
 	workspaceID := flags.String("workspace", "ws_local", "workspace ID")
 	deviceName := flags.String("name", hostname(), "device name")
+	registrationToken := flags.String("registration-token", "", "one-time user device registration token")
+	withHermes := flags.Bool("with-hermes", false, "development-only: create a local user-owned Hermes Companion app, grant, and policy")
+	start := flags.Bool("start", false, "start the Musubi device service after registration")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -759,6 +1238,9 @@ func runDeviceCLI(args []string) error {
 		"cli_version":     "0.1.0",
 		"public_key":      base64.StdEncoding.EncodeToString(publicKey.Bytes()),
 		"auth_public_key": base64.StdEncoding.EncodeToString(authPublic),
+	}
+	if strings.TrimSpace(*registrationToken) != "" {
+		request["registration_token"] = strings.TrimSpace(*registrationToken)
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -799,6 +1281,59 @@ func runDeviceCLI(args []string) error {
 	}
 	fmt.Printf("registered device %s with key %s\n", response.DeviceID, response.DeviceKeyID)
 	fmt.Printf("config written to %s\n", filepath.Join(*home, "config.json"))
+	if *withHermes {
+		fmt.Println("warning: --with-hermes is development-only; native Hermes Companion should use Musubi UI consent with loopback PKCE")
+		setup, err := setupLocalHermesCompanion(*serverURL, *home, *workspaceID, config)
+		if err != nil {
+			return err
+		}
+		printLocalHermesSetup(setup)
+	}
+	if *start {
+		fmt.Printf("starting device service for %s\n", config.DeviceID)
+		return startDeviceLoop([]string{"--home", *home})
+	}
+	return nil
+}
+
+func runHermesCLI(args []string) error {
+	if len(args) >= 1 && args[0] == "init" {
+		return runHermesInitCLI(args[1:])
+	}
+	return errors.New("usage: musubi hermes init --server <url> --home <path> --workspace <id> [--start]")
+}
+
+func runHermesInitCLI(args []string) error {
+	flags := flag.NewFlagSet("hermes init", flag.ContinueOnError)
+	serverURL := flags.String("server", "", "Musubi server URL")
+	home := flags.String("home", filepath.Join(defaultMusubiHome(), "hermes-device"), "Musubi device home directory")
+	workspaceID := flags.String("workspace", "", "workspace ID")
+	start := flags.Bool("start", false, "start the Musubi device service after Hermes setup")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	config, err := readDeviceConfig(*home)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*serverURL) == "" {
+		*serverURL = config.ServerURL
+	}
+	if strings.TrimSpace(*workspaceID) == "" {
+		*workspaceID = config.WorkspaceID
+	}
+	if strings.TrimSpace(*serverURL) == "" || strings.TrimSpace(*workspaceID) == "" {
+		return errors.New("--server and --workspace are required when config does not contain them")
+	}
+	setup, err := setupLocalHermesCompanion(*serverURL, *home, *workspaceID, config)
+	if err != nil {
+		return err
+	}
+	printLocalHermesSetup(setup)
+	if *start {
+		fmt.Printf("starting device service for %s\n", config.DeviceID)
+		return startDeviceLoop([]string{"--home", *home})
+	}
 	return nil
 }
 
@@ -1313,6 +1848,31 @@ func readAppConfig(home string, appID string) (map[string]string, error) {
 		return nil, err
 	}
 	return config, nil
+}
+
+func writeAppConfig(home string, appID string, config map[string]string) error {
+	appDir := filepath.Join(home, "apps")
+	if err := os.MkdirAll(appDir, 0700); err != nil {
+		return err
+	}
+	bytes, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(appDir, appID+".json"), bytes, 0600)
+}
+
+func absoluteControlPlaneURL(serverURL string, value string) string {
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		return value
+	}
+	if strings.HasPrefix(value, "/") {
+		return strings.TrimRight(serverURL, "/") + value
+	}
+	return strings.TrimRight(serverURL, "/") + "/" + value
 }
 
 func decodeX25519Private(value string) (*ecdh.PrivateKey, error) {

@@ -13,15 +13,31 @@ const home = `${process.cwd()}/.musubi/m2-control-plane`;
 const workspaceId = "ws_local";
 const prompt = "M2_CONTROL_PLANE_SECRET_PROMPT";
 
+process.env.NO_PROXY = ["127.0.0.1", "localhost", process.env.NO_PROXY].filter(Boolean).join(",");
+process.env.no_proxy = ["127.0.0.1", "localhost", process.env.no_proxy].filter(Boolean).join(",");
+
 await rm(home, { recursive: true, force: true });
 await assertM2Artifacts();
 const { server, serverUrl } = startAvailableRelay();
 let device: ReturnType<typeof spawn> | undefined;
+let adminCookie = "";
 
 try {
-  await run("go", ["run", "./cmd/musubi", "device", "register", "--server", serverUrl, "--home", home, "--workspace", workspaceId, "--name", "M2 Test Mac"]);
-  await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Hermes Web", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
-  await writePolicy(home, "app_001", ["hermes.task.create", "hermes.task.cancel", "hermes.task.status"]);
+  adminCookie = await adminLogin();
+  const hermesRegisterOutput = await run("go", ["run", "./cmd/musubi", "device", "register", "--server", serverUrl, "--home", home, "--workspace", workspaceId, "--name", "M2 Test Mac"]);
+  if (hermesRegisterOutput.includes("MUSUBI_API_KEY") || hermesRegisterOutput.includes("MUSUBI_APP_PRIVATE_KEY")) {
+    throw new Error("device registration printed Hermes app secrets");
+  }
+  const hermesCompanion = await postJson<any>(`${serverUrl}/v1/apps`, {
+    workspace_id: workspaceId,
+    name: "Hermes Companion",
+    type: "first_party",
+    description: "M2 verifier native Hermes Companion app",
+  });
+  const hermesSetupAppId = hermesCompanion.app_id;
+  const m2AppOutput = await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Hermes Web", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
+  const m2AppId = requiredMatch(m2AppOutput, /created app (app_\d+)/, "M2 Hermes Web app id");
+  await writePolicy(home, m2AppId, ["hermes.task.create", "hermes.task.cancel", "hermes.task.status"]);
 
   device = spawn("go", ["run", "./cmd/musubi", "start", "--home", home], {
     cwd: process.cwd(),
@@ -32,11 +48,32 @@ try {
   device.stderr.on("data", (chunk) => process.stderr.write(chunk));
   await waitForOnline();
 
-  const controlPlaneHtml = await text(`${serverUrl}/control-plane`);
+  const controlPlaneHtml = await text(`${serverUrl}/control-plane/user`);
   if (!controlPlaneHtml.includes("Musubi Control Plane")) throw new Error("control plane HTML route did not render");
   const controlPlaneJs = await text(`${serverUrl}/control-plane/app.js`);
   if (!controlPlaneJs.includes("Payload encrypted end-to-end")) throw new Error("control plane JS is missing privacy copy");
   if (!controlPlaneJs.includes("data-edit-grant")) throw new Error("control plane JS is missing grant edit flow");
+  if (!controlPlaneJs.includes("renderHermesSetup") || !controlPlaneJs.includes("device register --server ${server} --home ~/.musubi/hermes-device --workspace ws_local --name \"Hermes Mac\" --registration-token ${token} --start")) {
+    throw new Error("control plane JS is missing Hermes setup route");
+  }
+  for (const required of [
+    "--server ${server}",
+    "~/.musubi/hermes-device",
+    "--start",
+    "--registration-token",
+    "HERMES_COMMAND",
+    "Open Hermes Companion",
+    "Approve Access In Musubi",
+    "loopback PKCE",
+  ]) {
+    if (!controlPlaneJs.includes(required)) throw new Error(`Hermes setup command template missing ${required}`);
+  }
+  for (const forbidden of ["--with-hermes", "MUSUBI_API_KEY", "MUSUBI_APP_PRIVATE_KEY", "Authorization: `Basic", "Basic "]) {
+    if (controlPlaneJs.includes(forbidden)) throw new Error(`control plane JS contains forbidden setup/auth string ${forbidden}`);
+  }
+  if (controlPlaneJs.includes("bun run apps/hermes-companion/src/main.ts")) {
+    throw new Error("Hermes setup route should not ask users to run the in-repo companion app");
+  }
   if (!controlPlaneJs.includes("message-status-filter") || !controlPlaneJs.includes("audit-event-filter")) {
     throw new Error("control plane JS is missing message/audit filter controls");
   }
@@ -48,8 +85,12 @@ try {
   if (deviceRow.plugin_count < 1) throw new Error("devices list did not include reported plugin count");
 
   const apps = await requestJson(`${serverUrl}/v1/apps`);
-  const appRow = apps.apps.find((item: { id: string }) => item.id === "app_001");
+  const appRow = apps.apps.find((item: { id: string }) => item.id === m2AppId);
   if (!appRow || appRow.type !== "first_party") throw new Error("apps list did not show first-party app");
+  const hermesSetupApp = apps.apps.find((item: { id: string; type: string; name: string }) => item.id === hermesSetupAppId);
+  if (!hermesSetupApp || hermesSetupApp.type !== "first_party" || hermesSetupApp.name !== "Hermes Companion") {
+    throw new Error("apps list did not expose first-party Hermes Companion app");
+  }
 
   const deviceDetail = await requestJson(`${serverUrl}/v1/devices/dev_001`);
   assertDeviceDetail(deviceDetail, "dev_001");
@@ -57,16 +98,28 @@ try {
   if (!hermes) throw new Error("device detail did not include Hermes capability");
   if (!hermes.channels.includes("hermes.task.create")) throw new Error("Hermes create channel missing from device capability detail");
   if (!deviceDetail.local_policy?.copy?.includes("Local policy")) throw new Error("device detail did not include local policy placeholder copy");
-  assertAppDetail(await requestJson(`${serverUrl}/v1/apps/app_001`), "app_001");
+  assertAppDetail(await requestJson(`${serverUrl}/v1/apps/${m2AppId}`), m2AppId);
 
   const createdGrant = await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: workspaceId,
-    app_id: "app_001",
+    app_id: m2AppId,
     device_id: "dev_001",
     allowed_channels: ["hermes.task.create", "hermes.task.cancel", "hermes.task.status"],
     queueing_allowed: false,
     description: "M2 verifier grant",
   });
+  await postJson(`${serverUrl}/v1/grants`, {
+    workspace_id: workspaceId,
+    app_id: hermesSetupAppId,
+    device_id: "dev_001",
+    allowed_channels: ["hermes.task.create", "hermes.task.cancel", "hermes.task.status"],
+    queueing_allowed: false,
+    description: "M2 native Hermes setup grant",
+  });
+  const setupGrants = await requestJson<any>(`${serverUrl}/v1/grants?app_id=${hermesSetupAppId}`);
+  if (!setupGrants.grants.find((grant: any) => grant.device_id === "dev_001" && grant.status === "active" && grant.allowed_channels.includes("hermes.task.status"))) {
+    throw new Error("Hermes native setup grant was not detectable from grant list");
+  }
   if (createdGrant.status !== "active") throw new Error("grant create did not return active status");
   const grantId = createdGrant.grant_id;
   const editedGrant = await patchJson(`${serverUrl}/v1/grants/${grantId}`, {
@@ -128,17 +181,17 @@ try {
     device_id: "dev_001",
     allowed_channels: ["hermes.task.create"],
   });
-  const secondSend = await run("go", sendArgs("app_001", "hermes.task.create", "M2_SECOND_MESSAGE"));
+  const secondSend = await run("go", sendArgs(m2AppId, "hermes.task.create", "M2_SECOND_MESSAGE"));
   const secondMessageId = requiredMatch(secondSend, /(msg_m1_\d+)/, "second message id");
   if (!secondMessageId) {
     throw new Error("second Hermes message send did not return a message id");
   }
 
-  const completedOutput = await run("go", sendArgs("app_001", "hermes.task.create", prompt));
+  const completedOutput = await run("go", sendArgs(m2AppId, "hermes.task.create", prompt));
   if (!completedOutput.includes("completed")) throw new Error("Hermes task did not complete through M1 flow");
   const messageId = requiredMatch(completedOutput, /(msg_m1_\d+)/, "message id");
 
-  const messages = await requestJson(`${serverUrl}/v1/messages?app_id=app_001`);
+  const messages = await requestJson(`${serverUrl}/v1/messages?app_id=${m2AppId}`);
   assertNoPlaintext(messages, "messages list");
   if (!messages.messages.find((item: { id: string; status: string }) => item.id === messageId && item.status === "completed")) {
     throw new Error("messages list did not include completed Hermes message");
@@ -173,7 +226,7 @@ try {
   await expectPagedList(`${serverUrl}/v1/devices`, "devices");
   await expectPagedList(`${serverUrl}/v1/apps`, "apps", true);
   await expectPagedList(`${serverUrl}/v1/grants`, "grants", true);
-  await expectPagedList(`${serverUrl}/v1/messages?app_id=app_001`, "messages", true);
+  await expectPagedList(`${serverUrl}/v1/messages?app_id=${m2AppId}`, "messages", true);
   await expectPagedList(`${serverUrl}/v1/developers`, "developers", true);
   await expectPagedList(`${serverUrl}/v1/publishers`, "publishers", true);
   await expectPagedList(`${serverUrl}/v1/authorized-apps`, "authorized_apps", true);
@@ -195,17 +248,17 @@ try {
   }
 
   await postJson(`${serverUrl}/v1/grants/${grantId}/revoke`, {});
-  await expectSendDenied("app_001", "hermes.task.create", "M2_GRANT_REVOKED_SECRET", "grant denied");
+  await expectSendDenied(m2AppId, "hermes.task.create", "M2_GRANT_REVOKED_SECRET", "grant denied");
 
   const secondGrant = await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: workspaceId,
-    app_id: "app_001",
+    app_id: m2AppId,
     device_id: "dev_001",
     allowed_channels: ["hermes.task.create"],
   });
   if (secondGrant.status !== "active") throw new Error("second grant was not created");
-  await postJson(`${serverUrl}/v1/apps/app_001/revoke`, {});
-  await expectSendDenied("app_001", "hermes.task.create", "M2_APP_REVOKED_SECRET", "app denied");
+  await postJson(`${serverUrl}/v1/apps/${m2AppId}/revoke`, {});
+  await expectSendDenied(m2AppId, "hermes.task.create", "M2_APP_REVOKED_SECRET", "app denied");
 
   const revokeDeviceAppOutput = await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Device Revoke Test", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
   const revokeDeviceAppId = requiredMatch(revokeDeviceAppOutput, /created app (app_\d+)/, "device revoke app id");
@@ -383,6 +436,18 @@ async function expectPagedList(url: string, key: string, requireNextCursor = fal
   }
 }
 
+async function adminLogin() {
+  const response = await fetch(`${serverUrl}/v1/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "admin", password: "musubi-admin-local" }),
+  });
+  if (!response.ok) throw new Error(`admin login failed: ${response.status} ${await response.text()}`);
+  const cookie = response.headers.get("set-cookie")?.split(";")[0];
+  if (!cookie) throw new Error("admin login did not return cookie");
+  return cookie;
+}
+
 function requiredMatch(output: string, pattern: RegExp, label: string): string {
   const match = output.match(pattern);
   if (!match) throw new Error(`could not parse ${label} from output:\n${output}`);
@@ -453,6 +518,7 @@ async function sendJson(method: string, url: string, body: unknown): Promise<any
     method,
     "-H",
     "Content-Type: application/json",
+    ...(adminCookie ? ["-H", `Cookie: ${adminCookie}`] : []),
     "--data-binary",
     JSON.stringify(body),
     url,

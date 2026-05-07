@@ -17,7 +17,7 @@ type MessageState =
 interface MessageEnvelope {
   message_id: string;
   workspace_id: string;
-  app_id: string;
+  app_id?: string;
   device_id: string;
   channel: string;
   ciphertext: string;
@@ -210,10 +210,79 @@ interface ConsentRequestRecord {
   redirect_uri?: string;
   requested_capabilities: Array<{ plugin: string; channels: string[]; reason?: string }>;
   status: "pending" | "approved" | "cancelled" | "expired";
+  kind?: "third_party" | "native_pkce";
+  workspace_id?: string;
+  code_challenge?: string;
+  code_challenge_method?: "S256";
+  app_public_key?: string;
+  selected_device_id?: string;
+  authorization_code_hash?: string;
+  authorization_code_used_at?: string;
   created_at: string;
   completed_at?: string;
   expires_at?: string;
   grant_id?: string;
+}
+
+interface AppSessionTokenRecord {
+  id: string;
+  token_hash: string;
+  app_id: string;
+  user_id: string;
+  workspace_id: string;
+  app_key_id?: string;
+  status: "active" | "revoked";
+  created_at: string;
+  expires_at: string;
+  last_used_at?: string;
+  revoked_at?: string;
+  revoked_by?: string;
+}
+
+interface UserRecord {
+  id: string;
+  email?: string;
+  name?: string;
+  password_hash?: string;
+  password_salt?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+interface UserSessionRecord {
+  id: string;
+  token_hash: string;
+  user_id: string;
+  workspace_id: string;
+  status: "active" | "revoked";
+  created_at: string;
+  expires_at: string;
+  last_used_at?: string;
+  revoked_at?: string;
+}
+
+interface DeviceRegistrationTokenRecord {
+  id: string;
+  token_hash: string;
+  user_id: string;
+  workspace_id: string;
+  status: "active" | "used" | "revoked";
+  created_at: string;
+  expires_at: string;
+  used_at?: string;
+  used_device_id?: string;
+  revoked_at?: string;
+}
+
+interface AdminSessionRecord {
+  id: string;
+  token_hash: string;
+  user_id: string;
+  status: "active" | "revoked";
+  created_at: string;
+  expires_at: string;
+  last_used_at?: string;
+  revoked_at?: string;
 }
 
 interface AppAbuseReportRecord {
@@ -247,10 +316,9 @@ interface RegistryPluginVersion {
   signature_status?: "verified" | "invalid" | "unsigned";
 }
 
-interface AppAuth {
-  app: AppRecord;
-  apiKey: AppApiKeyRecord;
-}
+type AppAuth =
+  | { kind: "api_key"; app: AppRecord; apiKey: AppApiKeyRecord }
+  | { kind: "native_session"; app: AppRecord; session: AppSessionTokenRecord };
 
 export class DeviceSession {
   private state: DurableObjectState;
@@ -273,11 +341,53 @@ export class DeviceSession {
       return this.handleInternalDevice(request, url);
     }
 
+    if (url.pathname === "/v1/admin/login" && request.method === "POST") {
+      return this.handleAdminLogin(request);
+    }
+
+    if (url.pathname === "/v1/admin/logout" && request.method === "POST") {
+      await drainRequestBody(request);
+      return this.handleAdminLogout(request);
+    }
+
+    if (url.pathname === "/v1/admin/me" && request.method === "GET") {
+      return this.handleAdminMe(request);
+    }
+
+    if (url.pathname === "/v1/user/signup" && request.method === "POST") {
+      return this.handleUserSignup(request);
+    }
+
+    if (url.pathname === "/v1/user/login" && request.method === "POST") {
+      return this.handleUserLogin(request);
+    }
+
+    if (url.pathname === "/v1/user/logout" && request.method === "POST") {
+      await drainRequestBody(request);
+      return this.handleUserLogout(request);
+    }
+
+    if (url.pathname === "/v1/user/me" && request.method === "GET") {
+      return this.handleUserMe(request);
+    }
+
+    if (url.pathname === "/v1/user/device-registration-tokens" && request.method === "POST") {
+      return this.handleCreateDeviceRegistrationToken(request);
+    }
+
+    if (url.pathname === "/v1/users" && request.method === "GET") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
+      return this.handleListUsers(url);
+    }
+
     if (url.pathname === "/v1/devices/register" && request.method === "POST") {
       return this.handleRegisterDevice(request);
     }
 
     if (url.pathname === "/v1/apps" && request.method === "POST") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleCreateApp(request);
     }
 
@@ -286,10 +396,12 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/devices" && request.method === "GET") {
-      return this.handleListDevices(url);
+      return this.handleListDevices(request, url);
     }
 
     if (url.pathname === "/v1/developers" && request.method === "POST") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleCreateDeveloper(request);
     }
 
@@ -299,10 +411,14 @@ export class DeviceSession {
 
     const developerMatch = url.pathname.match(/^\/v1\/developers\/([^/]+)$/);
     if (developerMatch && request.method === "PATCH") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleUpdateDeveloper(request, developerMatch[1]);
     }
 
     if (url.pathname === "/v1/publishers" && request.method === "POST") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleCreatePublisher(request);
     }
 
@@ -312,20 +428,28 @@ export class DeviceSession {
 
     const publisherMatch = url.pathname.match(/^\/v1\/publishers\/([^/]+)$/);
     if (publisherMatch && request.method === "PATCH") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleUpdatePublisher(request, publisherMatch[1]);
     }
 
     if (url.pathname === "/v1/developer/apps" && request.method === "POST") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleCreateDeveloperApp(request);
     }
 
     const developerApiKeyMatch = url.pathname.match(/^\/v1\/developer\/apps\/([^/]+)\/api-keys$/);
     if (developerApiKeyMatch && request.method === "POST") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleCreateAppApiKey(request, developerApiKeyMatch[1]);
     }
 
     const declarationMatch = url.pathname.match(/^\/v1\/developer\/apps\/([^/]+)\/permission-declarations$/);
     if (declarationMatch && request.method === "POST") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleCreatePermissionDeclaration(request, declarationMatch[1]);
     }
 
@@ -333,9 +457,17 @@ export class DeviceSession {
       return this.handleCreateConsentRequest(request);
     }
 
+    if (url.pathname === "/v1/oauth/native/authorize" && request.method === "POST") {
+      return this.handleCreateNativeAuthorization(request, url);
+    }
+
+    if (url.pathname === "/v1/oauth/native/token" && request.method === "POST") {
+      return this.handleNativeTokenExchange(request);
+    }
+
     const consentMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)$/);
     if (consentMatch && request.method === "GET") {
-      return this.handleGetConsentRequest(consentMatch[1]);
+      return this.handleGetConsentRequest(request, consentMatch[1]);
     }
 
     const consentApproveMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)\/approve$/);
@@ -353,7 +485,7 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/grants" && request.method === "GET") {
-      return this.handleListGrants(url);
+      return this.handleListGrants(request, url);
     }
 
     if (url.pathname === "/v1/permissions/check" && request.method === "POST") {
@@ -367,11 +499,12 @@ export class DeviceSession {
 
     const grantRevokeMatch = url.pathname.match(/^\/v1\/grants\/([^/]+)\/revoke$/);
     if (grantRevokeMatch && request.method === "POST") {
-      return this.handleRevokeGrant(grantRevokeMatch[1]);
+      await drainRequestBody(request);
+      return this.handleRevokeGrant(request, grantRevokeMatch[1]);
     }
 
     if (url.pathname === "/v1/authorized-apps" && request.method === "GET") {
-      return this.handleListAuthorizedApps(url);
+      return this.handleListAuthorizedApps(request, url);
     }
 
     if (url.pathname === "/v1/plugins" && request.method === "GET") {
@@ -399,6 +532,8 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/workspace/plugin-policy" && request.method === "PATCH") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleUpdateWorkspacePluginPolicy(request);
     }
 
@@ -409,16 +544,23 @@ export class DeviceSession {
 
     const appSuspendMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/suspend$/);
     if (appSuspendMatch && request.method === "POST") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
+      await drainRequestBody(request);
       return this.handleSuspendApp(appSuspendMatch[1]);
     }
 
     const appRevokeMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/revoke$/);
     if (appRevokeMatch && request.method === "POST") {
-      return this.handleRevokeApp(appRevokeMatch[1]);
+      await drainRequestBody(request);
+      const user = await this.optionalUserSession(request);
+      return user ? this.handleRevokeAppForUser(appRevokeMatch[1], user.user_id) : this.handleRevokeApp(appRevokeMatch[1]);
     }
 
     const apiKeyMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/api-keys$/);
     if (apiKeyMatch && request.method === "POST") {
+      const rejected = await this.requireAdmin(request);
+      if (rejected) return rejected;
       return this.handleCreateAppApiKey(request, apiKeyMatch[1]);
     }
     if (apiKeyMatch && request.method === "GET") {
@@ -432,7 +574,7 @@ export class DeviceSession {
 
     const deviceMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)$/);
     if (deviceMatch && request.method === "GET") {
-      return this.handleGetDevice(deviceMatch[1]);
+      return this.handleGetDevice(request, deviceMatch[1]);
     }
 
     if (url.pathname === "/v1/messages" && request.method === "POST") {
@@ -440,7 +582,7 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/messages" && request.method === "GET") {
-      return this.handleListMessages(url);
+      return this.handleListMessages(request, url);
     }
 
     const cancelMatch = url.pathname.match(/^\/v1\/messages\/([^/]+)\/cancel$/);
@@ -462,17 +604,21 @@ export class DeviceSession {
       return this.handleListGrantedAppDevices(request, url);
     }
 
+    if (url.pathname === "/v1/app/me" && request.method === "GET") {
+      return this.handleGetAppIdentity(request);
+    }
+
     const appDeviceKeyMatch = url.pathname.match(/^\/v1\/app\/devices\/([^/]+)\/public-key$/);
     if (appDeviceKeyMatch && request.method === "GET") {
       return this.handleGetAppDevicePublicKey(request, appDeviceKeyMatch[1]);
     }
 
     if (url.pathname === "/v1/audit-events" && request.method === "GET") {
-      return this.handleGetAuditEvents(url);
+      return this.handleGetAuditEvents(request, url);
     }
 
     if (url.pathname === "/v1/device-plugin-capabilities" && request.method === "GET") {
-      return this.handleListDevicePluginCapabilities(url);
+      return this.handleListDevicePluginCapabilities(request, url);
     }
 
     const connectMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/connect$/);
@@ -495,8 +641,29 @@ export class DeviceSession {
       cli_version: string;
       public_key: string;
       auth_public_key?: string;
+      registration_token?: string;
     };
     const sql = this.neon();
+    let ownerUserId = "user_local";
+    let workspaceId = body.workspace_id;
+    let registrationToken: DeviceRegistrationTokenRecord | undefined;
+    if (body.registration_token) {
+      const requiredSql = this.neonRequired();
+      if (requiredSql instanceof Response) return requiredSql;
+      const tokenHash = await sha256Hex(body.registration_token);
+      registrationToken = (await requiredSql`
+        select *
+        from device_registration_tokens
+        where token_hash = ${tokenHash}
+          and status = 'active'
+          and expires_at > now()
+          and used_at is null
+        limit 1
+      ` as DeviceRegistrationTokenRecord[])[0];
+      if (!registrationToken) return Response.json({ error: "device registration token denied" }, { status: 403 });
+      ownerUserId = registrationToken.user_id;
+      workspaceId = registrationToken.workspace_id;
+    }
     const devices = await this.list<DeviceRecord>("devices");
     const suffix = String(devices.length + 1).padStart(3, "0");
     const deviceId = sql ? generatedId("dev") : `dev_${suffix}`;
@@ -504,8 +671,8 @@ export class DeviceSession {
     const now = new Date().toISOString();
     const device: DeviceRecord = {
       id: deviceId,
-      workspace_id: body.workspace_id,
-      owner_user_id: "user_local",
+      workspace_id: workspaceId,
+      owner_user_id: ownerUserId,
       name: body.device_name,
       platform: body.platform,
       cli_version: body.cli_version,
@@ -522,14 +689,23 @@ export class DeviceSession {
     };
     await this.putMapItem("devices", deviceId, device);
     await this.putMapItem("device_keys", keyId, key);
-    await this.persistWorkspace(body.workspace_id);
-    await this.persistUser({ id: "user_local", name: "Local User" });
+    await this.persistWorkspace(workspaceId);
+    await this.persistUser({ id: ownerUserId, name: ownerUserId === "user_local" ? "Local User" : undefined });
     await this.persistDevice(device);
     await this.persistDeviceKey(key);
-    await this.audit("user", "user_local", "device.registered", {
-      workspace_id: body.workspace_id,
+    if (registrationToken && sql) {
+      await sql`
+        update device_registration_tokens
+        set status = 'used',
+            used_at = ${now},
+            used_device_id = ${deviceId}
+        where id = ${registrationToken.id}
+      `;
+    }
+    await this.audit("user", ownerUserId, "device.registered", {
+      workspace_id: workspaceId,
       device_id: deviceId,
-      metadata: { device_key_id: keyId, platform: body.platform },
+      metadata: { device_key_id: keyId, platform: body.platform, registration_token_id: registrationToken?.id },
     });
 
     return Response.json({
@@ -539,18 +715,313 @@ export class DeviceSession {
     });
   }
 
+  private async handleAdminLogin(request: Request): Promise<Response> {
+    const body = await request.json().catch(() => ({})) as { username?: string; password?: string };
+    const expectedUsername = this.env.MUSUBI_ADMIN_USERNAME ?? "admin";
+    const expectedPassword = this.env.MUSUBI_ADMIN_PASSWORD ?? "musubi-admin-local";
+    if (body.username !== expectedUsername || body.password !== expectedPassword) {
+      return Response.json({ error: "invalid admin credentials" }, { status: 401 });
+    }
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const secret = `musubi_admin_${randomBase64Url(24)}`;
+    const now = new Date().toISOString();
+    const session: AdminSessionRecord = {
+      id: generatedId("adminsess"),
+      token_hash: await sha256Hex(secret),
+      user_id: "admin_local",
+      status: "active",
+      created_at: now,
+      expires_at: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
+    };
+    await sql`
+      insert into admin_sessions (
+        id, token_hash, user_id, status, created_at, expires_at
+      ) values (
+        ${session.id}, ${session.token_hash}, ${session.user_id}, ${session.status}, ${session.created_at}, ${session.expires_at}
+      )
+    `;
+    await this.audit("admin", "admin_local", "admin.login", { workspace_id: "ws_local", metadata: { session_id: session.id } });
+    return Response.json(
+      { admin: { id: "admin_local", username: expectedUsername }, expires_at: session.expires_at },
+      { headers: { "Set-Cookie": adminCookie(secret, 12 * 60 * 60) } },
+    );
+  }
+
+  private async handleAdminMe(request: Request): Promise<Response> {
+    const session = await this.authenticateAdminRequest(request);
+    if (session instanceof Response) return session;
+    return Response.json({
+      admin: { id: session.user_id, username: this.env.MUSUBI_ADMIN_USERNAME ?? "admin" },
+      session: { id: session.id, expires_at: session.expires_at, last_used_at: session.last_used_at },
+    });
+  }
+
+  private async handleAdminLogout(request: Request): Promise<Response> {
+    const token = parseCookies(request).musubi_admin_session;
+    if (token) {
+      const sql = this.neon();
+      if (sql) {
+        const tokenHash = await sha256Hex(token);
+        await sql`
+          update admin_sessions
+          set status = 'revoked',
+              revoked_at = ${new Date().toISOString()}
+          where token_hash = ${tokenHash}
+        `;
+      }
+    }
+    return Response.json({ ok: true }, { headers: { "Set-Cookie": adminCookie("", 0) } });
+  }
+
+  private async handleUserSignup(request: Request): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as { email?: string; name?: string; password?: string; workspace_id?: string };
+    const email = normalizeEmail(body.email);
+    const password = String(body.password ?? "");
+    if (!email || !email.includes("@")) return Response.json({ error: "valid email required" }, { status: 400 });
+    if (password.length < 8) return Response.json({ error: "password must be at least 8 characters" }, { status: 400 });
+    const existing = (await sql`select id from users where lower(email) = ${email} limit 1` as UserRecord[])[0];
+    if (existing) return Response.json({ error: "user already exists" }, { status: 409 });
+    const workspaceId = body.workspace_id || "ws_local";
+    const salt = randomBase64Url(16);
+    const now = new Date().toISOString();
+    const user: UserRecord = {
+      id: generatedId("user"),
+      email,
+      name: body.name || email,
+      password_salt: salt,
+      password_hash: await deriveUserPasswordHash(password, salt),
+      created_at: now,
+      updated_at: now,
+    };
+    await this.persistWorkspace(workspaceId);
+    await sql`
+      insert into users (id, email, name, password_hash, password_salt, created_at, updated_at)
+      values (${user.id}, ${user.email ?? null}, ${user.name ?? null}, ${user.password_hash ?? null}, ${user.password_salt ?? null}, ${user.created_at}, ${user.updated_at ?? null})
+    `;
+    await this.audit("user", user.id, "user.created", { workspace_id: workspaceId, metadata: { user_id: user.id, email } });
+    return this.createUserSessionResponse(user, workspaceId);
+  }
+
+  private async handleUserLogin(request: Request): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as { email?: string; password?: string; workspace_id?: string };
+    const email = normalizeEmail(body.email);
+    const user = (await sql`select * from users where lower(email) = ${email} limit 1` as UserRecord[])[0];
+    if (!user?.password_hash || !user.password_salt || !(await verifyUserPassword(String(body.password ?? ""), user.password_salt, user.password_hash))) {
+      return Response.json({ error: "invalid user credentials" }, { status: 401 });
+    }
+    return this.createUserSessionResponse(user, body.workspace_id || "ws_local");
+  }
+
+  private async createUserSessionResponse(user: UserRecord, workspaceId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    await this.persistWorkspace(workspaceId);
+    const secret = `musubi_user_${randomBase64Url(24)}`;
+    const now = new Date();
+    const session: UserSessionRecord = {
+      id: generatedId("usersess"),
+      token_hash: await sha256Hex(secret),
+      user_id: user.id,
+      workspace_id: workspaceId,
+      status: "active",
+      created_at: now.toISOString(),
+      expires_at: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    };
+    await sql`
+      insert into user_sessions (id, token_hash, user_id, workspace_id, status, created_at, expires_at)
+      values (${session.id}, ${session.token_hash}, ${session.user_id}, ${session.workspace_id}, ${session.status}, ${session.created_at}, ${session.expires_at})
+    `;
+    await this.audit("user", user.id, "user.login", { workspace_id: workspaceId, metadata: { session_id: session.id } });
+    return Response.json(
+      {
+        user: { id: user.id, email: user.email, name: user.name, workspace_id: workspaceId },
+        session: { id: session.id, expires_at: session.expires_at },
+      },
+      { headers: { "Set-Cookie": userCookie(secret, 7 * 24 * 60 * 60) } },
+    );
+  }
+
+  private async handleUserMe(request: Request): Promise<Response> {
+    const session = await this.authenticateUserRequest(request);
+    if (session instanceof Response) return session;
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const user = (await sql`select * from users where id = ${session.user_id} limit 1` as UserRecord[])[0];
+    if (!user) return Response.json({ error: "user session required" }, { status: 401 });
+    return Response.json({
+      user: { id: user.id, email: user.email, name: user.name, workspace_id: session.workspace_id },
+      session: { id: session.id, expires_at: session.expires_at, last_used_at: session.last_used_at },
+    });
+  }
+
+  private async handleUserLogout(request: Request): Promise<Response> {
+    const token = parseCookies(request).musubi_user_session;
+    if (token) {
+      const sql = this.neon();
+      if (sql) {
+        const tokenHash = await sha256Hex(token);
+        await sql`
+          update user_sessions
+          set status = 'revoked',
+              revoked_at = ${new Date().toISOString()}
+          where token_hash = ${tokenHash}
+        `;
+      }
+    }
+    return Response.json({ ok: true }, { headers: { "Set-Cookie": userCookie("", 0) } });
+  }
+
+  private async handleCreateDeviceRegistrationToken(request: Request): Promise<Response> {
+    const session = await this.requireUser(request);
+    if (session instanceof Response) return session;
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as { workspace_id?: string };
+    const workspaceId = body.workspace_id || session.workspace_id || "ws_local";
+    await this.persistWorkspace(workspaceId);
+    const secret = `musubi_devreg_${randomBase64Url(24)}`;
+    const now = new Date();
+    const token: DeviceRegistrationTokenRecord = {
+      id: generatedId("devreg"),
+      token_hash: await sha256Hex(secret),
+      user_id: session.user_id,
+      workspace_id: workspaceId,
+      status: "active",
+      created_at: now.toISOString(),
+      expires_at: new Date(now.getTime() + 15 * 60 * 1000).toISOString(),
+    };
+    await sql`
+      insert into device_registration_tokens (id, token_hash, user_id, workspace_id, status, created_at, expires_at)
+      values (${token.id}, ${token.token_hash}, ${token.user_id}, ${token.workspace_id}, ${token.status}, ${token.created_at}, ${token.expires_at})
+    `;
+    await this.audit("user", session.user_id, "device_registration_token.created", { workspace_id: workspaceId, metadata: { token_id: token.id } });
+    return Response.json({
+      registration_token: secret,
+      registration_token_id: token.id,
+      workspace_id: workspaceId,
+      expires_at: token.expires_at,
+      expires_in: 15 * 60,
+    });
+  }
+
+  private async handleListUsers(url: URL): Promise<Response> {
+    const sql = this.neon();
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url);
+    if (!sql) {
+      const users = (await this.list<UserRecord>("users"))
+        .sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`))
+        .map(({ password_hash, password_salt, ...user }) => user);
+      const page = paginateList(users, url, (user) => user.id, limit);
+      return Response.json({ users: page.page, next_cursor: page.next_cursor, limit: page.limit });
+    }
+    const rows = await sql`
+      select id, email, name, created_at, updated_at
+      from users
+      where (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by created_at desc, id desc
+      limit ${limit + 1}
+    ` as Array<Omit<UserRecord, "password_hash" | "password_salt">>;
+    const page = rows.slice(0, limit);
+    return Response.json({ users: page, next_cursor: nextKeysetCursor(page, rows.length, limit), limit });
+  }
+
+  private async requireAdmin(request: Request): Promise<Response | undefined> {
+    if (readBearer(request)) {
+      await drainRequestBody(request);
+      return Response.json({ error: "app runtime credentials cannot manage control plane resources" }, { status: 403 });
+    }
+    const admin = await this.authenticateAdminRequest(request);
+    if (admin instanceof Response) {
+      await drainRequestBody(request);
+      return admin;
+    }
+    return undefined;
+  }
+
+  private async authenticateAdminRequest(request: Request): Promise<AdminSessionRecord | Response> {
+    const token = parseCookies(request).musubi_admin_session;
+    if (!token) return Response.json({ error: "admin session required" }, { status: 401 });
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const tokenHash = await sha256Hex(token);
+    const session = (await sql`
+      select *
+      from admin_sessions
+      where token_hash = ${tokenHash}
+        and status = 'active'
+        and expires_at > now()
+      limit 1
+    ` as AdminSessionRecord[])[0];
+    if (!session) return Response.json({ error: "admin session required" }, { status: 401 });
+    await sql`
+      update admin_sessions
+      set last_used_at = ${new Date().toISOString()}
+      where id = ${session.id}
+    `;
+    return session;
+  }
+
+  private async authenticateUserRequest(request: Request): Promise<UserSessionRecord | Response> {
+    const token = parseCookies(request).musubi_user_session;
+    if (!token) return Response.json({ error: "user session required" }, { status: 401 });
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const tokenHash = await sha256Hex(token);
+    const session = (await sql`
+      select *
+      from user_sessions
+      where token_hash = ${tokenHash}
+        and status = 'active'
+        and expires_at > now()
+      limit 1
+    ` as UserSessionRecord[])[0];
+    if (!session) return Response.json({ error: "user session required" }, { status: 401 });
+    await sql`
+      update user_sessions
+      set last_used_at = ${new Date().toISOString()}
+      where id = ${session.id}
+    `;
+    return session;
+  }
+
+  private async optionalUserSession(request: Request): Promise<UserSessionRecord | undefined> {
+    const session = await this.authenticateUserRequest(request);
+    return session instanceof Response ? undefined : session;
+  }
+
+  private async effectiveUser(request: Request): Promise<{ id: string; workspace_id: string; authenticated: boolean }> {
+    const session = await this.optionalUserSession(request);
+    return session
+      ? { id: session.user_id, workspace_id: session.workspace_id, authenticated: true }
+      : { id: "user_local", workspace_id: "ws_local", authenticated: false };
+  }
+
+  private async requireUser(request: Request): Promise<UserSessionRecord | Response> {
+    if (readBearer(request)) {
+      await drainRequestBody(request);
+      return Response.json({ error: "app runtime credentials cannot manage user resources" }, { status: 403 });
+    }
+    return this.authenticateUserRequest(request);
+  }
+
   private async handleCreateApp(request: Request): Promise<Response> {
     const body = await request.json() as {
       workspace_id: string;
       name: string;
       type?: "first_party" | "user_owned" | "third_party";
-      public_key: string;
+      public_key?: string;
     };
     const sql = this.neon();
     const apps = await this.list<AppRecord>("apps");
     const suffix = String(apps.length + 1).padStart(3, "0");
     const appId = sql ? generatedId("app") : `app_${suffix}`;
-    const keyId = sql ? generatedId("appkey") : `appkey_${suffix}`;
+    const keyId = body.public_key ? (sql ? generatedId("appkey") : `appkey_${suffix}`) : undefined;
     const now = new Date().toISOString();
     const app: AppRecord = {
       id: appId,
@@ -560,18 +1031,18 @@ export class DeviceSession {
       status: "active",
       created_at: now,
     };
-    const key: AppKeyRecord = {
+    await this.putMapItem("apps", appId, app);
+    const key: AppKeyRecord | undefined = body.public_key && keyId ? {
       id: keyId,
       app_id: appId,
       public_key: body.public_key,
       status: "active",
       created_at: now,
-    };
-    await this.putMapItem("apps", appId, app);
-    await this.putMapItem("app_keys", keyId, key);
+    } : undefined;
+    if (key) await this.putMapItem("app_keys", keyId!, key);
     await this.persistWorkspace(body.workspace_id);
     await this.persistApp(app);
-    await this.persistAppKey(key);
+    if (key) await this.persistAppKey(key);
     await this.audit("user", "user_local", "app.created", {
       workspace_id: body.workspace_id,
       app_id: appId,
@@ -628,7 +1099,14 @@ export class DeviceSession {
         and revoked_at is null
       group by app_id
     ` as Array<{ app_id: string; authorized_device_count: number; allowed_channel_count: number }>;
+    const declarations = await sql`
+      select *
+      from app_permission_declarations
+      where app_id = any(${appIds}::text[])
+      order by created_at asc
+    ` as PermissionDeclarationRecord[];
     const countsByAppId = new Map(grantCounts.map((row) => [row.app_id, row]));
+    const declarationsByAppId = groupBy(declarations, (declaration) => declaration.app_id);
     const apps = pageRows.map((app) => {
       const counts = countsByAppId.get(app.id);
       return {
@@ -640,7 +1118,7 @@ export class DeviceSession {
               verification_status: app.publisher_verification_status,
             }
           : undefined,
-        permission_declarations: [],
+        permission_declarations: declarationsByAppId.get(app.id) ?? [],
         authorized_device_count: counts?.authorized_device_count ?? 0,
         allowed_channel_count: counts?.allowed_channel_count ?? 0,
       };
@@ -648,14 +1126,16 @@ export class DeviceSession {
     return Response.json({ apps, next_cursor: nextKeysetCursor(pageRows, rows.length, limit), limit });
   }
 
-  private async handleListDevices(url: URL): Promise<Response> {
+  private async handleListDevices(request: Request, url: URL): Promise<Response> {
     const sql = this.neon();
+    const user = await this.optionalUserSession(request);
     if (!sql) {
       let devices = await this.list<DeviceRecord>("devices");
       const workspaceId = url.searchParams.get("workspace_id");
       const status = url.searchParams.get("status");
       if (workspaceId) devices = devices.filter((device) => device.workspace_id === workspaceId);
       if (status) devices = devices.filter((device) => device.status === status);
+      if (user) devices = devices.filter((device) => device.owner_user_id === user.user_id);
       devices = devices.sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
       const { page, next_cursor, limit } = paginateList(devices, url, (device) => device.id);
       return Response.json({ devices: page, next_cursor, limit });
@@ -670,6 +1150,7 @@ export class DeviceSession {
         from devices
         where (${workspaceId}::text is null or workspace_id = ${workspaceId})
           and (${status}::text is null or status = ${status})
+          and (${user?.user_id ?? null}::text is null or owner_user_id = ${user?.user_id ?? null})
           and (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
         order by created_at desc, id desc
         limit ${limit + 1}
@@ -1107,9 +1588,168 @@ export class DeviceSession {
     });
   }
 
-  private async handleGetConsentRequest(consentId: string): Promise<Response> {
+  private async handleCreateNativeAuthorization(request: Request, requestUrl: URL): Promise<Response> {
     const sql = this.neonRequired();
     if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as {
+      client_id?: string;
+      app_id?: string;
+      workspace_id?: string;
+      redirect_uri?: string;
+      code_challenge?: string;
+      code_challenge_method?: string;
+      requested_capabilities?: Array<{ plugin: string; channels: string[]; reason?: string }>;
+      app_public_key?: string;
+      state?: string;
+    };
+    const appId = body.client_id || body.app_id;
+    const app = appId ? await this.hostedApp(appId) : undefined;
+    if (!app || app.workspace_id !== (body.workspace_id ?? app.workspace_id) || app.status !== "active") {
+      return Response.json({ error: "app denied" }, { status: 400 });
+    }
+    const redirectDenied = validateLoopbackRedirect(body.redirect_uri);
+    if (redirectDenied) return Response.json({ error: redirectDenied }, { status: 400 });
+    if (body.code_challenge_method !== "S256") return Response.json({ error: "code_challenge_method must be S256" }, { status: 400 });
+    if (!body.code_challenge || body.code_challenge.length < 32) return Response.json({ error: "code_challenge required" }, { status: 400 });
+    if (!body.app_public_key) return Response.json({ error: "app_public_key required" }, { status: 400 });
+    const requested = body.requested_capabilities ?? [];
+    const allowed = new Set(["hermes.task.create", "hermes.task.cancel", "hermes.task.status"]);
+    const requestedChannels = requested.flatMap((item) => item.channels ?? []);
+    if (!requested.length || requested.some((item) => item.plugin !== "hermes") || requestedChannels.some((channel) => !allowed.has(channel))) {
+      return Response.json({ error: "requested native channels denied" }, { status: 400 });
+    }
+    if (app.type === "third_party") {
+      const declarations = await this.hostedPermissionDeclarations(app.id);
+      const declared = new Set(declarations.flatMap((item) => item.channels));
+      const undeclared = requestedChannels.filter((channel) => !declared.has(channel));
+      if (undeclared.length) return Response.json({ error: `undeclared channels: ${undeclared.join(", ")}` }, { status: 400 });
+    }
+    const consent: ConsentRequestRecord = {
+      id: generatedId("nativeauth"),
+      kind: "native_pkce",
+      app_id: app.id,
+      workspace_id: app.workspace_id,
+      user_id: "user_local",
+      state: body.state,
+      redirect_uri: body.redirect_uri,
+      requested_capabilities: requested,
+      status: "pending",
+      code_challenge: body.code_challenge,
+      code_challenge_method: "S256",
+      app_public_key: body.app_public_key,
+      created_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    };
+    await this.persistUser({ id: "user_local", name: "Local User" });
+    await sql`
+      insert into consent_requests (
+        id, app_id, user_id, state, redirect_uri, requested_capabilities, status, kind, workspace_id,
+        code_challenge, code_challenge_method, app_public_key, created_at, expires_at
+      ) values (
+        ${consent.id}, ${consent.app_id}, ${consent.user_id ?? null}, ${consent.state ?? null},
+        ${consent.redirect_uri ?? null}, ${JSON.stringify(consent.requested_capabilities)}::jsonb,
+        ${consent.status}, ${consent.kind}, ${consent.workspace_id ?? null},
+        ${consent.code_challenge ?? null}, ${consent.code_challenge_method ?? null}, ${consent.app_public_key ?? null},
+        ${consent.created_at}, ${consent.expires_at ?? null}
+      )
+    `;
+    await this.audit("app", app.id, "native_authorization.requested", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { authorization_id: consent.id, requested_channels: requestedChannels },
+    });
+    return Response.json({
+      authorization_id: consent.id,
+      authorization_url: `${requestUrl.origin}/control-plane#consent/${consent.id}`,
+      consent_request: consent,
+      expires_in: 600,
+    });
+  }
+
+  private async handleNativeTokenExchange(request: Request): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as { code?: string; redirect_uri?: string; code_verifier?: string };
+    if (!body.code || !body.redirect_uri || !body.code_verifier) return Response.json({ error: "code, redirect_uri, and code_verifier required" }, { status: 400 });
+    const codeHash = await sha256Hex(body.code);
+    const consent = (await sql`
+      select *
+      from consent_requests
+      where kind = 'native_pkce'
+        and authorization_code_hash = ${codeHash}
+      limit 1
+    ` as ConsentRequestRecord[])[0];
+    if (!consent || consent.status !== "approved") return Response.json({ error: "invalid authorization code" }, { status: 400 });
+    if (consent.authorization_code_used_at) return Response.json({ error: "authorization code already used" }, { status: 400 });
+    if (Date.parse(consent.expires_at ?? "") <= Date.now()) return Response.json({ error: "authorization expired" }, { status: 400 });
+    if (consent.redirect_uri !== body.redirect_uri) return Response.json({ error: "redirect_uri mismatch" }, { status: 400 });
+    if (await pkceChallenge(body.code_verifier) !== consent.code_challenge) return Response.json({ error: "PKCE verifier denied" }, { status: 400 });
+    const app = await this.hostedApp(consent.app_id);
+    if (!app || app.status !== "active") return Response.json({ error: "app denied" }, { status: 403 });
+    const secret = `musubi_session_${randomBase64Url(24)}`;
+    const now = new Date().toISOString();
+    const appKey = (await sql`
+      select *
+      from app_keys
+      where app_id = ${app.id}
+        and public_key = ${consent.app_public_key ?? ""}
+        and status = 'active'
+      limit 1
+    ` as AppKeyRecord[])[0];
+    const token: AppSessionTokenRecord = {
+      id: generatedId("appsession"),
+      token_hash: await sha256Hex(secret),
+      app_id: app.id,
+      user_id: consent.user_id ?? "user_local",
+      workspace_id: consent.workspace_id ?? app.workspace_id,
+      app_key_id: appKey?.id,
+      status: "active",
+      created_at: now,
+      expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    };
+    await sql.transaction([
+      sql`
+        insert into app_session_tokens (
+          id, token_hash, app_id, user_id, workspace_id, app_key_id, status, created_at, expires_at
+        ) values (
+          ${token.id}, ${token.token_hash}, ${token.app_id}, ${token.user_id}, ${token.workspace_id},
+          ${token.app_key_id ?? null}, ${token.status}, ${token.created_at}, ${token.expires_at}
+        )
+      `,
+      sql`
+        update consent_requests
+        set authorization_code_used_at = ${now}
+        where id = ${consent.id}
+      `,
+    ]);
+    await this.audit("app", app.id, "native_session.created", {
+      workspace_id: token.workspace_id,
+      app_id: app.id,
+      device_id: consent.selected_device_id,
+      metadata: { session_id: token.id, authorization_id: consent.id },
+    });
+    const grants = await sql`
+      select device_id
+      from app_device_channel_grants
+      where app_id = ${app.id}
+        and workspace_id = ${token.workspace_id}
+        and revoked_at is null
+    ` as Array<{ device_id: string }>;
+    return Response.json({
+      access_token: secret,
+      token_type: "Bearer",
+      expires_in: 3600,
+      app_id: app.id,
+      app_session_token_id: token.id,
+      workspace_id: token.workspace_id,
+      granted_device_ids: [...new Set(grants.map((grant) => grant.device_id))],
+    });
+  }
+
+  private async handleGetConsentRequest(request: Request, consentId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const user = await this.optionalUserSession(request);
     const consent = await this.hostedConsent(consentId);
     if (!consent) return Response.json({ error: "not found" }, { status: 404 });
     const app = await this.hostedApp(consent.app_id);
@@ -1119,6 +1759,7 @@ export class DeviceSession {
       select *
       from devices
       where revoked_at is null
+        and (${user?.user_id ?? null}::text is null or owner_user_id = ${user?.user_id ?? null})
       order by created_at asc
       limit 100
     ` as DeviceRecord[];
@@ -1146,14 +1787,35 @@ export class DeviceSession {
     if (!consent || consent.status !== "pending") return Response.json({ error: "consent not pending" }, { status: 404 });
     const app = await this.hostedApp(consent.app_id);
     if (!app) return Response.json({ error: "app not found" }, { status: 404 });
+    const user = await this.effectiveUser(request);
     const body = await request.json().catch(() => ({})) as { device_id?: string; allowed_channels?: string[]; queueing_allowed?: boolean };
     const channels = body.allowed_channels ?? [];
     if (!body.device_id || channels.length === 0) return Response.json({ error: "device_id and allowed_channels required" }, { status: 400 });
-    const declarations = await this.hostedPermissionDeclarations(app.id);
-    const declared = new Set(declarations.flatMap((item) => item.channels));
-    const undeclared = channels.filter((channel) => !declared.has(channel));
-    if (undeclared.length) return Response.json({ error: `undeclared channels: ${undeclared.join(", ")}` }, { status: 400 });
-    const denied = await this.checkGrantPreconditions(app.workspace_id, app.id, body.device_id);
+    const selectedDevice = await this.hostedDevice(body.device_id);
+    if (!selectedDevice || selectedDevice.owner_user_id !== user.id) return Response.json({ error: "device denied" }, { status: 403 });
+    let appKey: AppKeyRecord | undefined;
+    if (consent.kind === "native_pkce") {
+      const requested = new Set(consent.requested_capabilities.flatMap((item) => item.channels));
+      const allowed = new Set(["hermes.task.create", "hermes.task.cancel", "hermes.task.status"]);
+      const deniedChannels = channels.filter((channel) => !requested.has(channel) || !allowed.has(channel));
+      if (deniedChannels.length) return Response.json({ error: `channel denied: ${deniedChannels.join(", ")}` }, { status: 400 });
+      if (!consent.app_public_key) return Response.json({ error: "app public key missing" }, { status: 400 });
+      appKey = {
+        id: generatedId("appkey"),
+        app_id: app.id,
+        public_key: consent.app_public_key,
+        status: "active",
+        created_at: new Date().toISOString(),
+      };
+    } else {
+      const declarations = await this.hostedPermissionDeclarations(app.id);
+      const declared = new Set(declarations.flatMap((item) => item.channels));
+      const undeclared = channels.filter((channel) => !declared.has(channel));
+      if (undeclared.length) return Response.json({ error: `undeclared channels: ${undeclared.join(", ")}` }, { status: 400 });
+    }
+    const denied = consent.kind === "native_pkce"
+      ? await this.checkNativeGrantPreconditions(app.workspace_id, app.id, body.device_id)
+      : await this.checkGrantPreconditions(app.workspace_id, app.id, body.device_id);
     if (denied) return Response.json({ status: "failed", error: denied }, { status: 400 });
 
     const now = new Date().toISOString();
@@ -1162,28 +1824,29 @@ export class DeviceSession {
       workspace_id: app.workspace_id,
       app_id: app.id,
       device_id: body.device_id,
-      name: "Third-party consent grant",
+      name: consent.kind === "native_pkce" ? "Native Hermes Companion consent grant" : "Third-party consent grant",
       allowed_channels: channels,
       queueing_allowed: body.queueing_allowed ?? false,
       created_from_consent_request_id: consent.id,
       created_at: now,
       updated_at: now,
     };
-    const approvedConsent = { ...consent, status: "approved" as const, completed_at: now, grant_id: grant.id };
+    const authorizationCode = consent.kind === "native_pkce" ? `code_${randomBase64Url(24)}` : undefined;
+    const approvedConsent = { ...consent, user_id: user.id, status: "approved" as const, completed_at: now, grant_id: grant.id, selected_device_id: body.device_id };
     const auditEvents = [
-      this.auditEvent("user", "user_local", "grant.created", {
+      this.auditEvent("user", user.id, "grant.created", {
         workspace_id: grant.workspace_id,
         app_id: grant.app_id,
         device_id: grant.device_id,
         metadata: { grant_id: grant.id, allowed_channels: grant.allowed_channels },
       }),
-      this.auditEvent("user", "user_local", "consent.approved", {
+      this.auditEvent("user", user.id, "consent.approved", {
         workspace_id: app.workspace_id,
         app_id: app.id,
         device_id: grant.device_id,
         metadata: { consent_id: consent.id, grant_id: grant.id, channels },
       }),
-      this.auditEvent("user", "user_local", "consent_request.approved", {
+      this.auditEvent("user", user.id, "consent_request.approved", {
         workspace_id: app.workspace_id,
         app_id: app.id,
         device_id: grant.device_id,
@@ -1191,12 +1854,22 @@ export class DeviceSession {
       }),
     ];
     await sql.transaction([
+      ...(appKey ? [sql`
+        insert into app_keys (
+          id, app_id, public_key, status, created_at
+        ) values (
+          ${appKey.id}, ${appKey.app_id}, ${appKey.public_key}, ${appKey.status}, ${appKey.created_at}
+        )
+      `] : []),
       this.persistGrantQuery(sql, grant),
       sql`
         update consent_requests
         set status = 'approved',
+            user_id = ${user.id},
             completed_at = ${now},
-            grant_id = ${grant.id}
+            grant_id = ${grant.id},
+            selected_device_id = ${body.device_id ?? null},
+            authorization_code_hash = ${authorizationCode ? await sha256Hex(authorizationCode) : null}
         where id = ${consent.id}
       `,
       ...auditEvents.map((event) => this.persistAuditEventQuery(sql, event)),
@@ -1206,7 +1879,11 @@ export class DeviceSession {
     return Response.json({
       status: "approved",
       grant_id: grant.id,
-      redirect_uri: consent.redirect_uri ? callbackUrl(consent.redirect_uri, consent.state, "approved", grant.id) : undefined,
+      redirect_uri: consent.redirect_uri
+        ? consent.kind === "native_pkce"
+          ? nativeCallbackUrl(consent.redirect_uri, consent.state, authorizationCode!)
+          : callbackUrl(consent.redirect_uri, consent.state, "approved", grant.id)
+        : undefined,
       consent_request: approvedConsent,
       grant: await this.grantView(grant),
     });
@@ -1219,6 +1896,7 @@ export class DeviceSession {
     if (!consent || consent.status !== "pending") return Response.json({ error: "consent not pending" }, { status: 404 });
     const app = await this.hostedApp(consent.app_id);
     if (!app) return Response.json({ error: "app not found" }, { status: 404 });
+    const user = await this.effectiveUser(request);
     const body = await request.json().catch(() => ({})) as { reason?: string };
     const now = new Date().toISOString();
     const cancelled = { ...consent, status: "cancelled" as const, completed_at: now };
@@ -1228,7 +1906,7 @@ export class DeviceSession {
           completed_at = ${now}
       where id = ${consent.id}
     `;
-    await this.audit("user", "user_local", "consent_request.denied", {
+    await this.audit("user", user.id, "consent_request.denied", {
       workspace_id: app.workspace_id,
       app_id: app.id,
       metadata: { consent_id: consent.id, reason: body.reason || "user_denied" },
@@ -1241,6 +1919,7 @@ export class DeviceSession {
   }
 
   private async handleCreateGrant(request: Request): Promise<Response> {
+    const user = await this.effectiveUser(request);
     const body = await request.json() as {
       workspace_id: string;
       app_id: string;
@@ -1251,6 +1930,8 @@ export class DeviceSession {
       description?: string;
       created_from_consent_request_id?: string;
     };
+    const device = await this.resolveDevice(body.device_id);
+    if (user.authenticated && device?.owner_user_id !== user.id) return Response.json({ error: "device denied" }, { status: 403 });
     const denied = await this.checkGrantPreconditions(body.workspace_id, body.app_id, body.device_id);
     if (denied) return Response.json({ status: "failed", error: denied }, { status: 400 });
 
@@ -1273,7 +1954,7 @@ export class DeviceSession {
     };
     await this.putMapItem("grants", grantId, grant);
     await this.persistGrant(grant);
-    await this.audit("user", "user_local", "grant.created", {
+    await this.audit("user", user.id, "grant.created", {
       workspace_id: body.workspace_id,
       app_id: body.app_id,
       device_id: body.device_id,
@@ -1282,10 +1963,16 @@ export class DeviceSession {
     return Response.json({ grant_id: grantId, status: "active", grant: await this.grantView(grant) });
   }
 
-  private async handleListGrants(url: URL): Promise<Response> {
+  private async handleListGrants(request: Request, url: URL): Promise<Response> {
     const sql = this.neon();
+    const user = await this.optionalUserSession(request);
     if (!sql) {
       let grants = await this.list<GrantRecord>("grants");
+      if (user) {
+        const devices = await this.list<DeviceRecord>("devices");
+        const ownedDeviceIds = new Set(devices.filter((device) => device.owner_user_id === user.user_id).map((device) => device.id));
+        grants = grants.filter((grant) => ownedDeviceIds.has(grant.device_id));
+      }
       for (const field of ["app_id", "device_id", "workspace_id"] as const) {
         const value = url.searchParams.get(field);
         if (value) grants = grants.filter((grant) => grant[field] === value);
@@ -1314,6 +2001,7 @@ export class DeviceSession {
       where (${appId}::text is null or grants.app_id = ${appId})
         and (${deviceId}::text is null or grants.device_id = ${deviceId})
         and (${workspaceId}::text is null or grants.workspace_id = ${workspaceId})
+        and (${user?.user_id ?? null}::text is null or devices.owner_user_id = ${user?.user_id ?? null})
         and (${cursor.created_at}::timestamptz is null or (grants.created_at, grants.id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
       order by grants.created_at desc, grants.id desc
       limit ${limit + 1}
@@ -1410,16 +2098,19 @@ export class DeviceSession {
     return Response.json({ device_id: deviceId, status: "ok", plugins_reported: body.plugins?.length ?? 0 });
   }
 
-  private async handleRevokeGrant(grantId: string): Promise<Response> {
+  private async handleRevokeGrant(request: Request, grantId: string): Promise<Response> {
+    const user = await this.effectiveUser(request);
     const sql = this.neon();
     const grant = sql ? await this.hostedGrant(grantId) : await this.getMapItem<GrantRecord>("grants", grantId);
     if (!grant) return Response.json({ error: "not found" }, { status: 404 });
+    const device = await this.resolveDevice(grant.device_id);
+    if (user.authenticated && device?.owner_user_id !== user.id) return Response.json({ error: "grant denied" }, { status: 403 });
     grant.revoked_at = new Date().toISOString();
-    grant.revoked_by = "user_local";
+    grant.revoked_by = user.id;
     grant.updated_at = grant.revoked_at;
     await this.putMapItem("grants", grantId, grant);
     await this.persistGrant(grant);
-    await this.audit("user", "user_local", "grant.revoked", {
+    await this.audit("user", user.id, "grant.revoked", {
       workspace_id: grant.workspace_id,
       app_id: grant.app_id,
       device_id: grant.device_id,
@@ -1428,8 +2119,9 @@ export class DeviceSession {
     return Response.json({ grant_id: grant.id, status: "revoked" });
   }
 
-  private async handleListAuthorizedApps(url: URL): Promise<Response> {
+  private async handleListAuthorizedApps(request: Request, url: URL): Promise<Response> {
     const sql = this.neon();
+    const user = await this.optionalUserSession(request);
     const limit = queryLimit(url, 100, 500);
     const cursor = keysetCursor(url);
     if (!sql) {
@@ -1446,7 +2138,7 @@ export class DeviceSession {
       const devicesById = new Map(devices.map((device) => [device.id, device]));
       const allGrants = await this.list<GrantRecord>("grants");
       const appIds = new Set(pageApps.map((app) => app.id));
-      const appGrants = allGrants.filter((grant) => appIds.has(grant.app_id));
+      const appGrants = allGrants.filter((grant) => appIds.has(grant.app_id) && (!user || devicesById.get(grant.device_id)?.owner_user_id === user.user_id));
       const grantsByAppId = groupBy(appGrants, (grant) => grant.app_id);
       const rows = [];
       for (const app of pageApps) {
@@ -1500,15 +2192,18 @@ export class DeviceSession {
         order by created_at asc
       ` as Promise<PermissionDeclarationRecord[]>,
       sql`
-        select *
-        from app_device_channel_grants
-        where app_id = any(${appIds}::text[])
-        order by created_at desc
+        select grants.*
+        from app_device_channel_grants grants
+        join devices on devices.id = grants.device_id
+        where grants.app_id = any(${appIds}::text[])
+          and (${user?.user_id ?? null}::text is null or devices.owner_user_id = ${user?.user_id ?? null})
+        order by grants.created_at desc
       ` as Promise<GrantRecord[]>,
       sql`
         select *
         from app_abuse_reports
         where app_id = any(${appIds}::text[])
+          and (${user?.user_id ?? null}::text is null or reporter_user_id = ${user?.user_id ?? null})
         order by created_at desc
       ` as Promise<AppAbuseReportRecord[]>,
     ]);
@@ -1603,12 +2298,13 @@ export class DeviceSession {
     if (sql instanceof Response) return sql;
     const app = await this.hostedApp(appId);
     if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const user = await this.effectiveUser(request);
     const body = await request.json().catch(() => ({})) as { reason?: string; description?: string };
-    await this.persistUser({ id: "user_local", name: "Local User" });
+    await this.persistUser({ id: user.id, name: user.id === "user_local" ? "Local User" : undefined });
     const report: AppAbuseReportRecord = {
       id: generatedId("report"),
       app_id: appId,
-      reporter_user_id: "user_local",
+      reporter_user_id: user.id,
       reason: body.reason || "other",
       description: body.description,
       status: "open",
@@ -1622,12 +2318,12 @@ export class DeviceSession {
         ${report.description ?? null}, ${report.status}, ${report.created_at}
       )
     `;
-    await this.audit("user", "user_local", "app.reported", {
+    await this.audit("user", user.id, "app.reported", {
       workspace_id: app.workspace_id,
       app_id: app.id,
       metadata: { report_id: report.id, reason: report.reason },
     });
-    await this.audit("user", "user_local", "third_party_app.reported", {
+    await this.audit("user", user.id, "third_party_app.reported", {
       workspace_id: app.workspace_id,
       app_id: app.id,
       metadata: { report_id: report.id, reason: report.reason },
@@ -1711,6 +2407,32 @@ export class DeviceSession {
     return Response.json({ app_id: app.id, status: app.status });
   }
 
+  private async handleRevokeAppForUser(appId: string, userId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const app = await this.hostedApp(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const now = new Date().toISOString();
+    const result = await sql`
+      update app_device_channel_grants
+      set revoked_at = ${now},
+          revoked_by = ${userId},
+          updated_at = ${now}
+      from devices
+      where app_device_channel_grants.device_id = devices.id
+        and app_device_channel_grants.app_id = ${app.id}
+        and devices.owner_user_id = ${userId}
+        and app_device_channel_grants.revoked_at is null
+      returning app_device_channel_grants.id
+    ` as Array<{ id: string }>;
+    await this.audit("user", userId, "app.grants_revoked", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_id: app.id, revoked_grants: result.length },
+    });
+    return Response.json({ app_id: app.id, status: app.status, revoked_grants: result.length });
+  }
+
   private async handleGetApp(appId: string): Promise<Response> {
     const sql = this.neon();
     if (sql) {
@@ -1730,12 +2452,50 @@ export class DeviceSession {
         order by created_at asc
       ` as AppApiKeyRecord[];
       const grants = await Promise.all((await this.hostedAppGrants(app.id)).map((grant) => this.grantView(grant)));
+      const recent_messages = await sql`
+        select
+          messages.id,
+          messages.id as message_id,
+          messages.workspace_id,
+          messages.app_id,
+          apps.name as app_name,
+          messages.device_id,
+          devices.name as device_name,
+          messages.channel,
+          messages.status,
+          messages.created_at,
+          messages.updated_at,
+          messages.expires_at,
+          messages.ciphertext,
+          messages.crypto
+        from messages
+        left join apps on apps.id = messages.app_id
+        left join devices on devices.id = messages.device_id
+        where messages.app_id = ${app.id}
+        order by messages.created_at desc, messages.id desc
+        limit 20
+      ` as any[];
       return Response.json({
         app: await this.hostedAppView(app),
         active_key,
         api_keys,
         grants,
-        recent_messages: [],
+        recent_messages: recent_messages.map((row) => ({
+          id: row.id,
+          message_id: row.message_id,
+          workspace_id: row.workspace_id,
+          app_id: row.app_id,
+          app_name: row.app_name,
+          device_id: row.device_id,
+          device_name: row.device_name,
+          channel: row.channel,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          expires_at: row.expires_at,
+          duration_ms: null,
+          crypto: messageCryptoView(row),
+        })),
         recent_audit_events: (await sql`
           select *
           from audit_events
@@ -1767,11 +2527,13 @@ export class DeviceSession {
     });
   }
 
-  private async handleGetDevice(deviceId: string): Promise<Response> {
+  private async handleGetDevice(request: Request, deviceId: string): Promise<Response> {
+    const user = await this.optionalUserSession(request);
     const sql = this.neon();
     if (sql) {
       const device = await this.hostedDevice(deviceId);
       if (!device) return Response.json({ error: "not found" }, { status: 404 });
+      if (user && device.owner_user_id !== user.user_id) return Response.json({ error: "not found" }, { status: 404 });
       const status = await this.deviceStatus(deviceId);
       const active_key = (await sql`
         select *
@@ -1780,6 +2542,29 @@ export class DeviceSession {
         order by created_at desc
         limit 1
       ` as DeviceKeyRecord[])[0];
+      const recent_messages = await sql`
+        select
+          messages.id,
+          messages.id as message_id,
+          messages.workspace_id,
+          messages.app_id,
+          apps.name as app_name,
+          messages.device_id,
+          devices.name as device_name,
+          messages.channel,
+          messages.status,
+          messages.created_at,
+          messages.updated_at,
+          messages.expires_at,
+          messages.ciphertext,
+          messages.crypto
+        from messages
+        left join apps on apps.id = messages.app_id
+        left join devices on devices.id = messages.device_id
+        where messages.device_id = ${device.id}
+        order by messages.created_at desc, messages.id desc
+        limit 20
+      ` as any[];
       return Response.json({
         device: { ...device, status: device.status === "revoked" ? "revoked" : status },
         active_key,
@@ -1790,7 +2575,22 @@ export class DeviceSession {
           order by reported_at desc
         `,
         grants: await Promise.all((await this.hostedDeviceGrants(device.id)).map((grant) => this.grantView(grant))),
-        recent_messages: [],
+        recent_messages: recent_messages.map((row) => ({
+          id: row.id,
+          message_id: row.message_id,
+          workspace_id: row.workspace_id,
+          app_id: row.app_id,
+          app_name: row.app_name,
+          device_id: row.device_id,
+          device_name: row.device_name,
+          channel: row.channel,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          expires_at: row.expires_at,
+          duration_ms: null,
+          crypto: messageCryptoView(row),
+        })),
         recent_audit_events: await sql`
           select *
           from audit_events
@@ -1803,6 +2603,7 @@ export class DeviceSession {
     }
     const device = await this.getMapItem<DeviceRecord>("devices", deviceId);
     if (!device) return Response.json({ error: "not found" }, { status: 404 });
+    if (user && device.owner_user_id !== user.user_id) return Response.json({ error: "not found" }, { status: 404 });
     const status = await this.deviceStatus(deviceId);
     const active_key = (await this.list<DeviceKeyRecord>("device_keys")).find(
       (key) => key.device_id === device.id && key.status === "active",
@@ -1831,8 +2632,24 @@ export class DeviceSession {
     const auth = readBearer(request) ? await this.authenticateAppRequest(request) : undefined;
     if (auth instanceof Response) return auth;
     const envelope = await request.json() as MessageEnvelope;
+    if (auth && !envelope.app_id) {
+      envelope.app_id = auth.app.id;
+      envelope.workspace_id ||= auth.app.workspace_id;
+    }
+    if (!envelope.app_id) {
+      return Response.json({ message_id: envelope.message_id, status: "failed", error: "app id required" }, { status: 400 });
+    }
     if (auth && envelope.app_id !== auth.app.id) {
       return Response.json({ message_id: envelope.message_id, status: "failed", error: "app id mismatch" }, { status: 403 });
+    }
+    if (auth?.kind === "native_session") {
+      if (envelope.workspace_id !== auth.session.workspace_id) {
+        return Response.json({ message_id: envelope.message_id, status: "failed", error: "workspace denied" }, { status: 403 });
+      }
+      const device = await this.hostedDevice(envelope.device_id);
+      if (!device || device.owner_user_id !== auth.session.user_id) {
+        return Response.json({ message_id: envelope.message_id, status: "failed", error: "device denied" }, { status: 403 });
+      }
     }
     const stored: StoredMessage = {
       envelope,
@@ -1894,6 +2711,7 @@ export class DeviceSession {
   private async handleGetMessage(messageId: string): Promise<Response> {
     const sql = this.neon();
     if (sql) {
+      const item = await this.getMapItem<StoredMessage>("messages", messageId);
       const row = (await sql`
         select
           messages.*,
@@ -1923,6 +2741,7 @@ export class DeviceSession {
         ` as Promise<AuditEventRecord[]>,
       ]);
       const crypto = messageCryptoView(row);
+      const history = item?.history?.length ? item.history : statusEvents.map((event) => event.status);
       const message = {
         id: row.id,
         message_id: row.id,
@@ -1941,9 +2760,9 @@ export class DeviceSession {
       return Response.json({
         message_id: row.id,
         status: row.status,
-        history: statusEvents.map((event) => event.status),
-        result: undefined,
-        result_events: [],
+        history,
+        result: item?.result,
+        result_events: item?.result_events ?? [],
         message,
         status_events: statusEvents,
         audit_events: auditEvents,
@@ -1989,8 +2808,9 @@ export class DeviceSession {
     });
   }
 
-  private async handleListMessages(url: URL): Promise<Response> {
+  private async handleListMessages(request: Request, url: URL): Promise<Response> {
     const sql = this.neon();
+    const user = await this.optionalUserSession(request);
     if (sql) {
       const appId = url.searchParams.get("app_id");
       const deviceId = url.searchParams.get("device_id");
@@ -2021,6 +2841,7 @@ export class DeviceSession {
           and (${deviceId}::text is null or messages.device_id = ${deviceId})
           and (${channel}::text is null or messages.channel = ${channel})
           and (${status}::text is null or messages.status = ${status})
+          and (${user?.user_id ?? null}::text is null or devices.owner_user_id = ${user?.user_id ?? null})
           and (${cursor.created_at}::timestamptz is null or (messages.created_at, messages.id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
         order by messages.created_at desc, messages.id desc
         limit ${limit + 1}
@@ -2048,6 +2869,11 @@ export class DeviceSession {
       });
     }
     let messages = await this.list<StoredMessage>("messages");
+    if (user) {
+      const devices = await this.list<DeviceRecord>("devices");
+      const ownedDeviceIds = new Set(devices.filter((device) => device.owner_user_id === user.user_id).map((device) => device.id));
+      messages = messages.filter((item) => ownedDeviceIds.has(item.envelope.device_id));
+    }
     for (const field of ["app_id", "device_id", "channel", "status"] as const) {
       const value = url.searchParams.get(field);
       if (!value) continue;
@@ -2104,8 +2930,9 @@ export class DeviceSession {
     return Response.json({ message_id: messageId, status: "cancelled" });
   }
 
-  private async handleGetAuditEvents(url: URL): Promise<Response> {
+  private async handleGetAuditEvents(request: Request, url: URL): Promise<Response> {
     const sql = this.neon();
+    const user = await this.optionalUserSession(request);
     const messageId = url.searchParams.get("message_id");
     const appId = url.searchParams.get("app_id");
     const deviceId = url.searchParams.get("device_id");
@@ -2114,6 +2941,7 @@ export class DeviceSession {
     const cursor = keysetCursor(url);
     if (!sql) {
       const events = (await this.list<AuditEventRecord>("audit_events"))
+        .filter((event) => !user || !event.device_id || event.actor_id === user.user_id)
         .filter((event) => !messageId || event.message_id === messageId)
         .filter((event) => !appId || event.app_id === appId)
         .filter((event) => !deviceId || event.device_id === deviceId)
@@ -2129,6 +2957,7 @@ export class DeviceSession {
         and (${appId}::text is null or app_id = ${appId})
         and (${deviceId}::text is null or device_id = ${deviceId})
         and (${eventType}::text is null or event_type = ${eventType})
+        and (${user?.user_id ?? null}::text is null or actor_id = ${user?.user_id ?? null} or device_id in (select id from devices where owner_user_id = ${user?.user_id ?? null}))
         and (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
       order by created_at desc, id desc
       limit ${limit + 1}
@@ -2137,8 +2966,9 @@ export class DeviceSession {
     return Response.json({ audit_events: page, next_cursor: nextKeysetCursor(page, events.length, limit), limit });
   }
 
-  private async handleListDevicePluginCapabilities(url: URL): Promise<Response> {
+  private async handleListDevicePluginCapabilities(request: Request, url: URL): Promise<Response> {
     const sql = this.neon();
+    const user = await this.optionalUserSession(request);
     const deviceId = url.searchParams.get("device_id");
     const limit = queryLimit(url, 100, 500);
     const cursor = keysetCursor(url, "reported_at");
@@ -2147,6 +2977,7 @@ export class DeviceSession {
         select *
         from device_plugin_capabilities
         where (${deviceId}::text is null or device_id = ${deviceId})
+          and (${user?.user_id ?? null}::text is null or device_id in (select id from devices where owner_user_id = ${user?.user_id ?? null}))
           and (${cursor.reported_at}::timestamptz is null or (reported_at, id) < (${cursor.reported_at}::timestamptz, ${cursor.id}::text))
         order by reported_at desc, id desc
         limit ${limit + 1}
@@ -2154,8 +2985,12 @@ export class DeviceSession {
       const page = capabilities.slice(0, limit);
       return Response.json({ capabilities: page, next_cursor: nextKeysetCursor(page, capabilities.length, limit, "reported_at"), limit });
     }
+    const ownedDeviceIds = user
+      ? new Set((await this.list<DeviceRecord>("devices")).filter((device) => device.owner_user_id === user.user_id).map((device) => device.id))
+      : undefined;
     const allCapabilities = (await this.list<DevicePluginCapabilityRecord>("device_plugin_capabilities"))
       .filter((capability) => !deviceId || capability.device_id === deviceId)
+      .filter((capability) => !ownedDeviceIds || ownedDeviceIds.has(capability.device_id))
       .sort((a, b) => `${b.reported_at}:${b.id}`.localeCompare(`${a.reported_at}:${a.id}`));
     const page = paginateList(allCapabilities, url, (capability) => capability.id, 100);
     return Response.json({ capabilities: page.page, next_cursor: page.next_cursor, limit: page.limit });
@@ -2223,6 +3058,8 @@ export class DeviceSession {
         and app_device_channel_grants.revoked_at is null
         and devices.revoked_at is null
         and devices.status != 'revoked'
+        and (${auth.kind === "native_session" ? auth.session.workspace_id : null}::text is null or app_device_channel_grants.workspace_id = ${auth.kind === "native_session" ? auth.session.workspace_id : null})
+        and (${auth.kind === "native_session" ? auth.session.user_id : null}::text is null or devices.owner_user_id = ${auth.kind === "native_session" ? auth.session.user_id : null})
         and (${cursor.created_at}::timestamptz is null or (devices.created_at, devices.id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
       order by devices.created_at desc, devices.id desc
       limit ${limit + 1}
@@ -2246,6 +3083,29 @@ export class DeviceSession {
     });
   }
 
+  private async handleGetAppIdentity(request: Request): Promise<Response> {
+    const auth = await this.authenticateAppRequest(request);
+    if (auth instanceof Response) return auth;
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const activeKey = (await sql`
+      select id
+      from app_keys
+      where app_id = ${auth.app.id}
+        and status = 'active'
+      order by created_at desc
+      limit 1
+    ` as AppKeyRecord[])[0];
+    return Response.json({
+      app_id: auth.app.id,
+      workspace_id: auth.app.workspace_id,
+      credential_type: auth.kind,
+      app_api_key_id: auth.kind === "api_key" ? auth.apiKey.id : undefined,
+      app_session_token_id: auth.kind === "native_session" ? auth.session.id : undefined,
+      active_app_key_id: auth.kind === "native_session" ? auth.session.app_key_id ?? activeKey?.id : activeKey?.id,
+    });
+  }
+
   private async handleGetAppDevicePublicKey(request: Request, deviceId: string): Promise<Response> {
     const auth = await this.authenticateAppRequest(request);
     if (auth instanceof Response) return auth;
@@ -2260,6 +3120,8 @@ export class DeviceSession {
         and app_device_channel_grants.revoked_at is null
         and devices.revoked_at is null
         and devices.status != 'revoked'
+        and (${auth.kind === "native_session" ? auth.session.workspace_id : null}::text is null or app_device_channel_grants.workspace_id = ${auth.kind === "native_session" ? auth.session.workspace_id : null})
+        and (${auth.kind === "native_session" ? auth.session.user_id : null}::text is null or devices.owner_user_id = ${auth.kind === "native_session" ? auth.session.user_id : null})
       order by app_device_channel_grants.created_at desc
       limit 1
     ` as GrantRecord[])[0];
@@ -2642,6 +3504,25 @@ export class DeviceSession {
     return undefined;
   }
 
+  private async checkNativeGrantPreconditions(workspaceId: string, appId: string, deviceId: string): Promise<string | undefined> {
+    const app = await this.hostedApp(appId);
+    if (!app || app.workspace_id !== workspaceId || app.status !== "active") return "app denied";
+    const device = await this.hostedDevice(deviceId);
+    if (!device || device.workspace_id !== workspaceId) return "device denied";
+    if (device.status === "revoked" || device.revoked_at) return "device revoked";
+    const sql = this.neon();
+    if (sql) {
+      const activeDeviceKey = (await sql`
+        select id
+        from device_keys
+        where device_id = ${deviceId} and status = 'active'
+        limit 1
+      ` as any[])[0];
+      if (!activeDeviceKey) return "device key denied";
+    }
+    return undefined;
+  }
+
   private async deliverToDevice(deviceId: string, envelope: MessageEnvelope): Promise<boolean> {
     const id = this.env.DEVICE_SESSION.idFromName(deviceId);
     const response = await this.env.DEVICE_SESSION.get(id).fetch(jsonRequest("https://device.internal/internal/device/deliver", envelope));
@@ -2827,15 +3708,19 @@ export class DeviceSession {
     `;
   }
 
-  private async persistUser(user: { id: string; name: string }) {
+  private async persistUser(user: { id: string; name?: string; email?: string; password_hash?: string; password_salt?: string; updated_at?: string }) {
     const sql = this.neon();
     if (!sql) return;
 
     await sql`
-      insert into users (id, name)
-      values (${user.id}, ${user.name})
+      insert into users (id, email, name, password_hash, password_salt, updated_at)
+      values (${user.id}, ${user.email ?? null}, ${user.name ?? null}, ${user.password_hash ?? null}, ${user.password_salt ?? null}, ${user.updated_at ?? null})
       on conflict (id) do update set
-        name = excluded.name
+        email = coalesce(excluded.email, users.email),
+        name = coalesce(excluded.name, users.name),
+        password_hash = coalesce(excluded.password_hash, users.password_hash),
+        password_salt = coalesce(excluded.password_salt, users.password_salt),
+        updated_at = coalesce(excluded.updated_at, users.updated_at)
     `;
   }
 
@@ -3169,6 +4054,10 @@ export class DeviceSession {
     ` as DeviceRecord[])[0];
   }
 
+  private async resolveDevice(deviceId: string): Promise<DeviceRecord | undefined> {
+    return await this.hostedDevice(deviceId) ?? await this.getMapItem<DeviceRecord>("devices", deviceId);
+  }
+
   private async hostedPublisher(publisherId: string): Promise<PublisherRecord | undefined> {
     const sql = this.neon();
     if (!sql) return undefined;
@@ -3308,7 +4197,7 @@ export class DeviceSession {
 
   private async authenticateAppRequest(request: Request): Promise<AppAuth | Response> {
     const token = readBearer(request);
-    if (!token) return Response.json({ error: "missing app api key" }, { status: 401 });
+    if (!token) return Response.json({ error: "missing app credential" }, { status: 401 });
     const sql = this.neonRequired();
     if (sql instanceof Response) return sql;
     const keyHash = await sha256Hex(token);
@@ -3319,7 +4208,25 @@ export class DeviceSession {
         and status = 'active'
       limit 1
     ` as AppApiKeyRecord[])[0];
-    if (!apiKey) return Response.json({ error: "invalid app api key" }, { status: 401 });
+    if (!apiKey) {
+      const session = (await sql`
+        select *
+        from app_session_tokens
+        where token_hash = ${keyHash}
+          and status = 'active'
+          and expires_at > now()
+        limit 1
+      ` as AppSessionTokenRecord[])[0];
+      if (!session) return Response.json({ error: "invalid app credential" }, { status: 401 });
+      const app = await this.hostedApp(session.app_id);
+      if (!app || app.status !== "active") return Response.json({ error: app?.status === "suspended" ? "app suspended" : "app denied" }, { status: 403 });
+      await sql`
+        update app_session_tokens
+        set last_used_at = ${new Date().toISOString()}
+        where id = ${session.id}
+      `;
+      return { kind: "native_session", app, session };
+    }
     const app = await this.hostedApp(apiKey.app_id);
     if (!app || app.status !== "active") return Response.json({ error: app?.status === "suspended" ? "app suspended" : "app denied" }, { status: 403 });
     if (app.trust_status === "blocked") return Response.json({ error: "app blocked" }, { status: 403 });
@@ -3330,7 +4237,7 @@ export class DeviceSession {
       set last_used_at = ${new Date().toISOString()}
       where id = ${apiKey.id}
     `;
-    return { app, apiKey };
+    return { kind: "api_key", app, apiKey };
   }
 
   private neon() {
@@ -3654,6 +4561,29 @@ function readBearer(request: Request): string | undefined {
   return header.slice("Bearer ".length).trim();
 }
 
+function parseCookies(request: Request): Record<string, string> {
+  const cookie = request.headers.get("Cookie") ?? "";
+  const parsed: Record<string, string> = {};
+  for (const part of cookie.split(";")) {
+    const index = part.indexOf("=");
+    if (index > 0) parsed[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+  }
+  return parsed;
+}
+
+function adminCookie(token: string, maxAgeSeconds: number): string {
+  return `musubi_admin_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
+}
+
+function userCookie(token: string, maxAgeSeconds: number): string {
+  return `musubi_user_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
+}
+
+async function drainRequestBody(request: Request): Promise<void> {
+  if (request.method === "GET" || request.method === "HEAD") return;
+  await request.arrayBuffer().catch(() => undefined);
+}
+
 function generatedId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
@@ -3671,10 +4601,59 @@ async function sha256Hex(input: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function normalizeEmail(email?: string): string {
+  return String(email ?? "").trim().toLowerCase();
+}
+
+async function deriveUserPasswordHash(password: string, salt: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: 100_000, hash: "SHA-256" },
+    key,
+    256,
+  );
+  return [...new Uint8Array(bits)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function verifyUserPassword(password: string, salt: string, expectedHash: string): Promise<boolean> {
+  return await deriveUserPasswordHash(password, salt) === expectedHash;
+}
+
 function callbackUrl(base: string, state: string | undefined, status: string, grantId?: string): string {
   const url = new URL(base);
   url.searchParams.set("status", status);
   if (state) url.searchParams.set("state", state);
   if (grantId) url.searchParams.set("grant_id", grantId);
   return url.toString();
+}
+
+function nativeCallbackUrl(base: string, state: string | undefined, code: string): string {
+  const url = new URL(base);
+  url.searchParams.set("code", code);
+  if (state) url.searchParams.set("state", state);
+  return url.toString();
+}
+
+async function pkceChallenge(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  let binary = "";
+  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function validateLoopbackRedirect(redirectUri?: string): string | undefined {
+  if (!redirectUri) return "redirect_uri required";
+  let url: URL;
+  try {
+    url = new URL(redirectUri);
+  } catch {
+    return "redirect_uri invalid";
+  }
+  if (url.protocol !== "http:") return "redirect_uri scheme denied";
+  if (url.hostname !== "127.0.0.1" && url.hostname !== "[::1]") return "redirect_uri host denied";
+  const port = Number(url.port);
+  if (!Number.isInteger(port) || port < 49152 || port > 65535) return "redirect_uri port denied";
+  if (url.pathname !== "/callback") return "redirect_uri path denied";
+  if (url.username || url.password) return "redirect_uri userinfo denied";
+  return undefined;
 }

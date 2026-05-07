@@ -8,19 +8,26 @@ import {
   assertPluginDetail,
   assertPluginPolicy,
 } from "./api_contract_assertions.ts";
+import { loadEnvFiles, requireHostedLocalNeon } from "./env.ts";
+
+loadEnvFiles();
+const databaseUrl = requireHostedLocalNeon("verify:slice11:local");
 
 const port = String(29000 + Math.floor(Math.random() * 1000));
 const serverUrl = `http://127.0.0.1:${port}`;
 const home = `${process.cwd()}/.musubi/slice11-hosted-local`;
+const workerEnvFile = `${process.cwd()}/.cache/slice11-hosted-local.env`;
 const wranglerEnv = {
   ...process.env,
+  NEON_DATABASE_URL: databaseUrl,
   TMPDIR: `${process.cwd()}/.cache/tmp`,
   BUN_INSTALL_CACHE_DIR: `${process.cwd()}/.cache/bun`,
 };
 
 await rm(home, { recursive: true, force: true });
+await writeFile(workerEnvFile, `NEON_DATABASE_URL=${databaseUrl}\n`);
 
-const worker = spawn("bunx", ["wrangler", "dev", "--ip", "127.0.0.1", "--port", port], {
+const worker = spawn("bunx", ["wrangler", "dev", "--ip", "127.0.0.1", "--port", port, "--env-file", workerEnvFile], {
   cwd: `${process.cwd()}/server/workers`,
   env: wranglerEnv,
   stdio: ["ignore", "pipe", "pipe"],
@@ -40,9 +47,9 @@ try {
   await waitForHealth();
 
   const deviceOutput = await run("go", ["run", "./cmd/musubi", "device", "register", "--server", serverUrl, "--home", home, "--workspace", "ws_hosted_local"]);
-  const deviceId = requiredMatch(deviceOutput, /registered device (dev_\d+)/, "device id");
+  const deviceId = requiredMatch(deviceOutput, /(dev_[a-z0-9]+)/, "device id");
   const appOutput = await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Hermes Web", "--server", serverUrl, "--home", home, "--workspace", "ws_hosted_local"]);
-  const appId = requiredMatch(appOutput, /created app (app_\d+)/, "app id");
+  const appId = requiredMatch(appOutput, /(app_[a-z0-9]+)/, "app id");
   await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: "ws_hosted_local",
     app_id: appId,
@@ -139,6 +146,7 @@ try {
 } finally {
   killDevice(device);
   worker.kill("SIGKILL");
+  await rm(workerEnvFile, { force: true });
 }
 
 console.log("[slice11-hosted-local] ok: wrangler dev Worker recorded capabilities, completed encrypted Hermes flow, and reconnected device");
@@ -196,12 +204,12 @@ async function waitForHealth() {
   for (let attempt = 0; attempt < 80; attempt += 1) {
     try {
       const health = await requestJson(`${serverUrl}/v1/health`);
-      if (health.ok) return;
+      if (health.ok && health.neon_configured) return;
     } catch {
       await Bun.sleep(250);
     }
   }
-  throw new Error(`worker did not become healthy:\n${workerOutput}`);
+  throw new Error(`worker did not become healthy with Neon configured:\n${workerOutput}`);
 }
 
 async function waitForOnline(deviceId: string) {

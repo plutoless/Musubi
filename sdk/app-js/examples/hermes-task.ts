@@ -2,10 +2,8 @@ import { MusubiApp, invokeHermes } from "../src/index.ts";
 
 const musubi = new MusubiApp({
   apiBaseUrl: process.env.MUSUBI_API_BASE_URL ?? "http://127.0.0.1:8787",
-  appId: required("MUSUBI_APP_ID"),
   apiKey: required("MUSUBI_API_KEY"),
   privateKey: required("MUSUBI_APP_PRIVATE_KEY"),
-  appKeyId: process.env.MUSUBI_APP_KEY_ID,
 });
 
 const deviceId = process.env.MUSUBI_DEVICE_ID ?? (await musubi.devices.listGranted())[0]?.id;

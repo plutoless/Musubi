@@ -8,15 +8,16 @@ export interface Env {
   NEON_DATABASE_URL?: string;
   MUSUBI_ENV?: string;
   CONTROL_PLANE_ENABLED?: string;
-  CONTROL_PLANE_BASIC_AUTH?: string;
+  MUSUBI_ADMIN_USERNAME?: string;
+  MUSUBI_ADMIN_PASSWORD?: string;
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/" && request.method === "GET" && controlPlaneEnabled(env)) {
-      return Response.redirect(`${url.origin}/control-plane`, 302);
+    if ((url.pathname === "/" || url.pathname === "/control-plane") && request.method === "GET" && controlPlaneEnabled(env)) {
+      return Response.redirect(`${url.origin}/control-plane/user`, 302);
     }
 
     if (url.pathname === "/control-plane" || url.pathname.startsWith("/control-plane/")) {
@@ -51,25 +52,14 @@ async function serveControlPlane(request: Request, env: Env): Promise<Response> 
   if (!controlPlaneEnabled(env)) {
     return new Response("control plane disabled", { status: 404 });
   }
-  if (!env.CONTROL_PLANE_BASIC_AUTH) {
-    return new Response("control plane auth not configured", { status: 503 });
-  }
   if (!env.ASSETS) {
     return new Response("control plane assets not configured", { status: 503 });
-  }
-  if (!authorized(request, env.CONTROL_PLANE_BASIC_AUTH)) {
-    return new Response("authentication required", {
-      status: 401,
-      headers: {
-        "WWW-Authenticate": 'Basic realm="Musubi Control Plane", charset="UTF-8"',
-      },
-    });
   }
 
   const url = new URL(request.url);
   const assetPath = url.pathname === "/control-plane"
     ? "/index.html"
-    : url.pathname.slice("/control-plane".length);
+    : controlPlaneAssetPath(url.pathname);
   const assetUrl = new URL(request.url);
   assetUrl.pathname = assetPath;
 
@@ -77,17 +67,8 @@ async function serveControlPlane(request: Request, env: Env): Promise<Response> 
   return env.ASSETS.fetch(assetRequest);
 }
 
-function authorized(request: Request, expected: string) {
-  const header = request.headers.get("Authorization");
-  if (!header?.startsWith("Basic ")) return false;
-  return timingSafeEqual(header.slice("Basic ".length), btoa(expected));
-}
-
-function timingSafeEqual(left: string, right: string) {
-  if (left.length !== right.length) return false;
-  let diff = 0;
-  for (let index = 0; index < left.length; index += 1) {
-    diff |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  }
-  return diff === 0;
+function controlPlaneAssetPath(pathname: string) {
+  const path = pathname.slice("/control-plane".length);
+  if (path === "/app.js" || path === "/styles.css") return path;
+  return "/index.html";
 }

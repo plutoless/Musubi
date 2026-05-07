@@ -13,10 +13,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  m1-local:
-    name: M1 Local Verification
+  core-ci:
+    name: Core CI (Unit + Local Integration)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Check out repository
@@ -41,48 +41,56 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Run Go tests
-        run: GOCACHE="$PWD/.cache/go-build" go test ./...
+      - name: Run core CI gate
+        run: bun run test:ci:core
 
-      - name: Verify protocol contracts
-        run: bun run verify:m1-contracts
+  hosted-local:
+    name: Hosted-Local Integration (Wrangler Dev + Neon)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: core-ci
+    env:
+      NEON_DATABASE_URL: ${{ secrets.STAGING_NEON_DATABASE_URL }}
 
-      - name: Verify local M1 slices
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check hosted-local Neon secret
         run: |
-          bun run verify:slice1
-          bun run verify:slice2
-          bun run verify:slice3
-          bun run verify:slice4
-          bun run verify:slice5
-          bun run verify:slice6
-          bun run verify:slice7
-          bun run verify:slice8
-          bun run verify:slice9
-          bun run verify:slice10
-          bun run verify:slice11
-          bun run verify:slice12
-          bun run verify:slice12:runtime
-          bun run verify:slice13
-          bun run verify:m2-control-plane
-          bun run verify:m2.5-codex
-          bun run verify:m3-app-sdk
-          bun run verify:m3.5-browser-session
-          bun run verify:m4-platform-trust
+          if [ -z "$NEON_DATABASE_URL" ]; then
+            echo "Skipping hosted-local integration because STAGING_NEON_DATABASE_URL is not configured."
+            exit 0
+          fi
 
-      - name: Verify hosted Worker build
-        run: bun run verify:slice11:build
-
-      - name: Verify hosted Worker locally
-        run: bun run verify:slice11:local
-
-      - name: Verify M1 readiness artifacts
-        run: bun run verify:m1-readiness
+      - name: Run hosted-local integration tier
+        if: ${{ env.NEON_DATABASE_URL != '' }}
+        run: bun run test:integration:hosted-local
 
   deploy-staging:
     name: Deploy Staging
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: m1-local
+    needs: core-ci
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     env:
@@ -127,8 +135,8 @@ jobs:
         working-directory: server/workers
         run: TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler deploy --env staging
 
-  verify-staging:
-    name: Verify Staging
+  remote-e2e-staging:
+    name: Remote E2E Smoke (Deployed Staging)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: deploy-staging
@@ -140,12 +148,12 @@ jobs:
       CONTROL_PLANE_BASIC_AUTH: ${{ secrets.STAGING_CONTROL_PLANE_BASIC_AUTH }}
 
     steps:
-      - name: Check required staging verifier secrets
+      - name: Check required remote smoke secrets
         run: |
           missing=0
           for name in NEON_DATABASE_URL MUSUBI_HOSTED_URL CONTROL_PLANE_BASIC_AUTH; do
             if [ -z "${!name}" ]; then
-              echo "::error::$name is required for staging verification. Configure STAGING_NEON_DATABASE_URL, STAGING_MUSUBI_HOSTED_URL, and STAGING_CONTROL_PLANE_BASIC_AUTH."
+              echo "::error::$name is required for remote E2E smoke. Configure STAGING_NEON_DATABASE_URL, STAGING_MUSUBI_HOSTED_URL, and STAGING_CONTROL_PLANE_BASIC_AUTH."
               missing=1
             fi
           done
@@ -173,19 +181,14 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Verify deployed staging Cloudflare and Neon flow
-        run: |
-          bun run verify:slice11:deployed
-          bun run verify:slice12:deployed
-          bun run verify:slice13:deployed
-          bun run verify:m4-hosted-deployed
-          bun run verify:control-plane:deployed
+      - name: Run minimum deployed smoke suite
+        run: bun run test:e2e:remote
 
   deploy-production:
     name: Deploy Production
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: verify-staging
+    needs: remote-e2e-staging
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: production
 
