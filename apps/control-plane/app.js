@@ -858,15 +858,28 @@ function paginationControls(key, response) {
   const page = paginationFor(key);
   const hasPrevious = page.history.length > 0;
   const hasNext = Boolean(response?.next_cursor);
+  const currentPage = page.history.length + 1;
   return `
     <div class="pagination-bar" data-pagination-key="${escapeHtml(key)}">
-      <button data-page-prev="${escapeHtml(key)}" ${hasPrevious ? "" : "disabled"}>Previous</button>
-      <label>Rows
-        <select data-page-limit="${escapeHtml(key)}">
-          ${[25, 50, 100, 200].map((limit) => `<option value="${limit}" ${page.limit === limit ? "selected" : ""}>${limit}</option>`).join("")}
-        </select>
-      </label>
-      <button data-page-next="${escapeHtml(key)}" data-next-cursor="${escapeHtml(response?.next_cursor || "")}" ${hasNext ? "" : "disabled"}>Next</button>
+      <div class="pagination-page-size">
+        <span>Rows per page</span>
+        <label class="pagination-select">
+          <select data-page-limit="${escapeHtml(key)}" aria-label="Rows per page">
+            ${[25, 50, 100, 200].map((limit) => `<option value="${limit}" ${page.limit === limit ? "selected" : ""}>${limit}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+      <div class="pagination-actions" aria-label="Pagination controls">
+        <button class="pagination-button" data-page-prev="${escapeHtml(key)}" aria-label="Previous page" ${hasPrevious ? "" : "disabled"}>
+          <span aria-hidden="true">‹</span>
+          <span>Previous</span>
+        </button>
+        <span class="pagination-status">Page ${currentPage}</span>
+        <button class="pagination-button" data-page-next="${escapeHtml(key)}" data-next-cursor="${escapeHtml(response?.next_cursor || "")}" aria-label="Next page" ${hasNext ? "" : "disabled"}>
+          <span>Next</span>
+          <span aria-hidden="true">›</span>
+        </button>
+      </div>
     </div>
   `;
 }
