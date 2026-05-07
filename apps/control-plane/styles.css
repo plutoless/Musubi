@@ -909,9 +909,7 @@ pre {
   }
 
   .sidebar {
-    position: sticky;
-    top: 0;
-    z-index: 3;
+    position: static;
     min-height: auto;
     border-right: 0;
     border-bottom: 1px solid var(--line-soft);

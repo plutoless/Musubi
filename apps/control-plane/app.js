@@ -984,8 +984,13 @@ function setHeader(nextTitle, nextCopy) {
 }
 
 function markActive() {
-  document.querySelectorAll("nav a").forEach((link) => {
-    link.classList.toggle("active", state.route.startsWith(link.dataset.route));
+  const links = [...document.querySelectorAll("nav a")];
+  const activeRoute = links
+    .map((link) => link.dataset.route)
+    .filter((route) => state.route === route || state.route.startsWith(`${route}/`))
+    .sort((a, b) => b.length - a.length)[0];
+  links.forEach((link) => {
+    link.classList.toggle("active", link.dataset.route === activeRoute);
   });
 }
 
