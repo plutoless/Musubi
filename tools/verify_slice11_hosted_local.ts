@@ -1,5 +1,13 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import {
+  assertAppDetail,
+  assertDeviceDetail,
+  assertMessageDetail,
+  assertPagedResponse,
+  assertPluginDetail,
+  assertPluginPolicy,
+} from "./api_contract_assertions.ts";
 
 const port = String(29000 + Math.floor(Math.random() * 1000));
 const serverUrl = `http://127.0.0.1:${port}`;
@@ -42,6 +50,23 @@ try {
     allowed_channels: ["hermes.task.create"],
   });
   await writePolicy(home, appId);
+  assertDeviceDetail(await requestJson(`${serverUrl}/v1/devices/${deviceId}`), deviceId);
+  assertAppDetail(await requestJson(`${serverUrl}/v1/apps/${appId}`), appId);
+  await assertPagedResponse(`${serverUrl}/v1/grants?device_id=${deviceId}`, "grants", {
+    requestJson,
+    validateRow: (row) => {
+      if (row.device_id !== deviceId) throw new Error("hosted local grants list ignored device_id filter");
+    },
+  });
+  assertPluginDetail(await requestJson(`${serverUrl}/v1/plugins/hermes`), "hermes");
+  assertPluginDetail(await requestJson(`${serverUrl}/v1/plugins/hermes/versions/0.1.0`), "hermes", "0.1.0");
+  assertPluginPolicy(await requestJson(`${serverUrl}/v1/workspace/plugin-policy`));
+  await assertPagedResponse(`${serverUrl}/v1/plugins`, "plugins", {
+    requestJson,
+    validateRow: (row) => {
+      if (!row.name || !row.version || !row.manifest) throw new Error("hosted local plugins list row missing registry fields");
+    },
+  });
 
   device = startDevice(home);
   await waitForOnline(deviceId);
@@ -50,6 +75,12 @@ try {
   if (!pluginNames.has("echo") || !pluginNames.has("hermes")) {
     throw new Error("hosted local Worker did not record echo and Hermes plugin capabilities");
   }
+  await assertPagedResponse(`${serverUrl}/v1/device-plugin-capabilities?device_id=${deviceId}`, "capabilities", {
+    requestJson,
+    validateRow: (row) => {
+      if (row.device_id !== deviceId) throw new Error("hosted local capabilities list ignored device_id filter");
+    },
+  });
 
   const output = await run("go", [
     "run",
@@ -71,11 +102,33 @@ try {
   if (!output.includes("hosted-hermes hosted local worker route")) {
     throw new Error("hosted local Worker did not return encrypted Hermes result");
   }
+  const messageId = requiredMatch(output, /(msg_m1_\d+)/, "message id");
+  await assertPagedResponse(`${serverUrl}/v1/messages?device_id=${deviceId}`, "messages", {
+    requestJson,
+    validateRow: (row) => {
+      if (row.device_id !== deviceId) throw new Error("hosted local messages list ignored device_id filter");
+    },
+  });
+  assertMessageDetail(await requestJson(`${serverUrl}/v1/messages/${messageId}`), messageId, ["hosted local worker route"]);
 
-  const audit = await requestJson(`${serverUrl}/v1/audit-events`);
+  const audit = await requestJson(`${serverUrl}/v1/audit-events?device_id=${deviceId}`);
   const eventTypes = new Set((audit.audit_events ?? []).map((event: { event_type: string }) => event.event_type));
   for (const eventType of ["message.created", "message.validated", "message.delivered", "message.received", "message.processing", "message.completed"]) {
     if (!eventTypes.has(eventType)) throw new Error(`hosted local Worker audit is missing ${eventType}`);
+  }
+  await assertPagedResponse(`${serverUrl}/v1/audit-events?device_id=${deviceId}`, "audit_events", {
+    requestJson,
+    validateRow: (row) => {
+      if (row.device_id !== deviceId) throw new Error("hosted local audit list ignored device_id filter");
+    },
+  });
+  const activeDeviceDetail = await requestJson(`${serverUrl}/v1/devices/${deviceId}`);
+  assertDeviceDetail(activeDeviceDetail, deviceId);
+  if (!activeDeviceDetail.recent_messages.some((message: { id?: string; message_id?: string }) => message.id === messageId || message.message_id === messageId)) {
+    throw new Error("device detail did not include recent completed message");
+  }
+  if (!activeDeviceDetail.recent_audit_events.some((event: { message_id?: string }) => event.message_id === messageId)) {
+    throw new Error("device detail did not include recent audit rows");
   }
 
   killDevice(device);

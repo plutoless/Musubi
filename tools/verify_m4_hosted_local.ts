@@ -2,6 +2,13 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { neon } from "@neondatabase/serverless";
 import { MusubiApp, generateX25519KeyPair, hermesPayload } from "../sdk/app-js/src/index.ts";
 import { loadEnvFiles } from "./env.ts";
+import {
+  assertApiKeyList,
+  assertAppDetail,
+  assertConsentDetail,
+  assertDeviceDetail,
+  assertMessageDetail,
+} from "./api_contract_assertions.ts";
 
 loadEnvFiles();
 const databaseUrl = process.env.NEON_DATABASE_URL;
@@ -202,6 +209,11 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     device_id: device.device_id,
     allowed_channels: ["hermes.task.create"],
   });
+  assertDeviceDetail(await requestJson<any>(`${apiBaseUrl}/v1/devices/${device.device_id}`), device.device_id);
+  assertDeviceDetail(await requestJson<any>(`${apiBaseUrl}/v1/devices/${secondaryDevice.device_id}`), secondaryDevice.device_id);
+  assertAppDetail(await requestJson<any>(`${apiBaseUrl}/v1/apps/${seedAppId}`), seedAppId);
+  assertAppDetail(await requestJson<any>(`${apiBaseUrl}/v1/apps/${secondaryApp.app_id}`), secondaryApp.app_id);
+  assertApiKeyList(await requestJson<any>(`${apiBaseUrl}/v1/apps/${seedAppId}/api-keys`), seedAppId);
 
   const deniedConsent = await postJson<any>(`${apiBaseUrl}/v1/consent-requests`, {
     app_id: app.app_id,
@@ -209,8 +221,10 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     redirect_uri: "https://example.test/callback",
     requested_capabilities: [{ plugin: "hermes", channels: ["hermes.task.create"], reason: "denial proof" }],
   });
+  assertConsentDetail(await requestJson<any>(`${apiBaseUrl}/v1/consent-requests/${deniedConsent.consent_request.id}`), deniedConsent.consent_request.id);
   const denied = await postJson<any>(`${apiBaseUrl}/v1/consent-requests/${deniedConsent.consent_request.id}/deny`, { reason: "user_declined" });
   if (denied.status !== "denied") throw new Error("hosted consent deny failed");
+  assertConsentDetail(await requestJson<any>(`${apiBaseUrl}/v1/consent-requests/${deniedConsent.consent_request.id}`), deniedConsent.consent_request.id, "cancelled");
 
   const consent = await postJson<any>(`${apiBaseUrl}/v1/consent-requests`, {
     app_id: app.app_id,
@@ -218,6 +232,7 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     redirect_uri: "https://example.test/callback",
   });
   const consentDetail = await requestJson<any>(`${apiBaseUrl}/v1/consent-requests/${consent.consent_request.id}`);
+  assertConsentDetail(consentDetail, consent.consent_request.id);
   if (consentDetail.publisher.display_name !== "Hosted M4 Publisher") throw new Error("hosted consent detail missed publisher");
   const approved = await postJson<any>(`${apiBaseUrl}/v1/consent-requests/${consent.consent_request.id}/approve`, {
     device_id: device.device_id,
@@ -225,6 +240,7 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     queueing_allowed: true,
   });
   if (!approved.grant_id) throw new Error("hosted consent approval did not create grant");
+  assertConsentDetail(await requestJson<any>(`${apiBaseUrl}/v1/consent-requests/${consent.consent_request.id}`), consent.consent_request.id, "approved");
 
   const client = new MusubiApp({
     apiBaseUrl,
@@ -234,21 +250,34 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     privateKey: appKeys.privateKey,
     workspaceId: workspace,
   });
-  await client.invoke({
+  const firstInvocation = await client.invoke({
     deviceId: device.device_id,
     channel: "hermes.task.create",
     payload: hermesPayload("HOSTED_M4_ENCRYPTED_PAYLOAD_1"),
   });
+  assertMessageDetail(await requestJson<any>(`${apiBaseUrl}/v1/messages/${firstInvocation.messageId}`), firstInvocation.messageId, ["HOSTED_M4_ENCRYPTED_PAYLOAD_1"]);
   const devices = await client.devices.listGranted();
   if (!devices.length) throw new Error("hosted SDK did not list any granted device");
   if (!devices.some((entry: { id: string }) => entry.id === device.device_id)) {
     throw new Error("hosted SDK did not list primary granted device");
   }
-  await client.invoke({
+  const appDevices = await requestJsonWithApiKey<any>(`${apiBaseUrl}/v1/app/devices?limit=1`, seedAppApiKey);
+  if (!Array.isArray(appDevices.devices) || appDevices.devices.length !== 1 || appDevices.limit !== 1) {
+    throw new Error("app-auth devices list did not honor limit=1");
+  }
+  if (!Array.isArray(appDevices.devices[0].allowed_channels) || typeof appDevices.devices[0].queueing_allowed !== "boolean") {
+    throw new Error("app-auth devices list missing grant fields");
+  }
+  const appDevicePublicKey = await requestJsonWithApiKey<any>(`${apiBaseUrl}/v1/app/devices/${device.device_id}/public-key`, seedAppApiKey);
+  if (appDevicePublicKey.public_key !== deviceKeys.publicKey || appDevicePublicKey.device_id !== device.device_id) {
+    throw new Error("app-auth device public key route returned unexpected key");
+  }
+  const secondInvocation = await client.invoke({
     deviceId: device.device_id,
     channel: "hermes.task.create",
     payload: hermesPayload("HOSTED_M4_ENCRYPTED_PAYLOAD_2"),
   });
+  assertMessageDetail(await requestJson<any>(`${apiBaseUrl}/v1/messages/${secondInvocation.messageId}`), secondInvocation.messageId, ["HOSTED_M4_ENCRYPTED_PAYLOAD_2"]);
   const pagedListSeedParams = { requireNextCursor: true };
   await expectPagedList(`${apiBaseUrl}/v1/devices?workspace_id=${workspace}`, "devices", {
     ...pagedListSeedParams,
@@ -316,6 +345,7 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     ...pagedListSeedParams,
     validateRow: (row) => {
       if (row.app_id !== seedAppId) throw new Error("app api keys list omitted app_id");
+      if ("key_hash" in row || "api_key" in row) throw new Error("app api keys list exposed secret material");
     },
   });
   await expectPagedList(`${apiBaseUrl}/v1/app/devices`, "devices", {

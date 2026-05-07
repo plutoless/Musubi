@@ -702,6 +702,7 @@ export class DeviceSession {
         id: device.id,
         name: device.display_name ?? device.name,
         status: device.status,
+        workspace_id: device.workspace_id,
         platform: device.platform,
         cli_version: device.cli_version,
         plugin_count: device.plugin_count,
@@ -1749,7 +1750,21 @@ export class DeviceSession {
     const active_key = (await this.list<AppKeyRecord>("app_keys")).find(
       (key) => key.app_id === app.id && key.status === "active",
     );
-    return Response.json({ app, active_key });
+    return Response.json({
+      app,
+      active_key,
+      api_keys: (await this.list<AppApiKeyRecord>("app_api_keys")).filter((key) => key.app_id === app.id),
+      grants: (await this.list<GrantRecord>("grants")).filter((grant) => grant.app_id === app.id),
+      recent_messages: (await this.list<StoredMessage>("messages"))
+        .filter((item) => item.envelope.app_id === app.id)
+        .sort((a, b) => (b.envelope.created_at ?? "").localeCompare(a.envelope.created_at ?? ""))
+        .slice(0, 20)
+        .map((item) => storedMessageView(item)),
+      recent_audit_events: (await this.list<AuditEventRecord>("audit_events"))
+        .filter((event) => event.app_id === app.id)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))
+        .slice(0, 50),
+    });
   }
 
   private async handleGetDevice(deviceId: string): Promise<Response> {
@@ -1783,6 +1798,7 @@ export class DeviceSession {
           order by created_at desc
           limit 50
         `,
+        local_policy: defaultLocalPolicyView(),
       });
     }
     const device = await this.getMapItem<DeviceRecord>("devices", deviceId);
@@ -1791,7 +1807,24 @@ export class DeviceSession {
     const active_key = (await this.list<DeviceKeyRecord>("device_keys")).find(
       (key) => key.device_id === device.id && key.status === "active",
     );
-    return Response.json({ device: { ...device, status }, active_key });
+    return Response.json({
+      device: { ...device, status },
+      active_key,
+      capabilities: (await this.list<DevicePluginCapabilityRecord>("device_plugin_capabilities"))
+        .filter((capability) => capability.device_id === device.id)
+        .sort((a, b) => `${b.reported_at}:${b.id}`.localeCompare(`${a.reported_at}:${a.id}`)),
+      grants: (await this.list<GrantRecord>("grants")).filter((grant) => grant.device_id === device.id),
+      recent_messages: (await this.list<StoredMessage>("messages"))
+        .filter((item) => item.envelope.device_id === device.id)
+        .sort((a, b) => (b.envelope.created_at ?? "").localeCompare(a.envelope.created_at ?? ""))
+        .slice(0, 20)
+        .map((item) => storedMessageView(item)),
+      recent_audit_events: (await this.list<AuditEventRecord>("audit_events"))
+        .filter((event) => event.device_id === device.id)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))
+        .slice(0, 50),
+      local_policy: defaultLocalPolicyView(),
+    });
   }
 
   private async handleCreateMessage(request: Request): Promise<Response> {
@@ -3579,6 +3612,30 @@ function messageCryptoView(row: any) {
     sender_key_id: crypto.sender_key_id ?? "",
     recipient_key_id: crypto.recipient_key_id ?? "",
     payload_size: crypto.payload_size ?? ciphertext.length,
+  };
+}
+
+function storedMessageView(item: StoredMessage) {
+  return {
+    id: item.envelope.message_id,
+    message_id: item.envelope.message_id,
+    workspace_id: item.envelope.workspace_id,
+    app_id: item.envelope.app_id,
+    device_id: item.envelope.device_id,
+    channel: item.envelope.channel,
+    status: item.status,
+    created_at: item.envelope.created_at,
+    updated_at: item.envelope.created_at,
+    duration_ms: null,
+    crypto: messageCryptoView({ ...item.envelope, id: item.envelope.message_id }),
+  };
+}
+
+function defaultLocalPolicyView() {
+  return {
+    status: "not_reported",
+    default_behavior: "deny by default",
+    copy: "Cloud grants allow an app to ask. Local policy on this machine still decides whether the request can run.",
   };
 }
 

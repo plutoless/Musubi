@@ -1,6 +1,13 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { startRelay } from "../apps/relay-server/src/main.ts";
+import {
+  assertAppDetail,
+  assertDeviceDetail,
+  assertMessageDetail,
+  assertPluginDetail,
+  assertPluginPolicy,
+} from "./api_contract_assertions.ts";
 
 const home = `${process.cwd()}/.musubi/m2-control-plane`;
 const workspaceId = "ws_local";
@@ -45,10 +52,12 @@ try {
   if (!appRow || appRow.type !== "first_party") throw new Error("apps list did not show first-party app");
 
   const deviceDetail = await requestJson(`${serverUrl}/v1/devices/dev_001`);
+  assertDeviceDetail(deviceDetail, "dev_001");
   const hermes = deviceDetail.capabilities.find((item: { plugin_name: string }) => item.plugin_name === "hermes");
   if (!hermes) throw new Error("device detail did not include Hermes capability");
   if (!hermes.channels.includes("hermes.task.create")) throw new Error("Hermes create channel missing from device capability detail");
   if (!deviceDetail.local_policy?.copy?.includes("Local policy")) throw new Error("device detail did not include local policy placeholder copy");
+  assertAppDetail(await requestJson(`${serverUrl}/v1/apps/app_001`), "app_001");
 
   const createdGrant = await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: workspaceId,
@@ -106,6 +115,7 @@ try {
   });
   await postJson(`${serverUrl}/v1/apps/${thirdPartyAppOne.app_id}/api-keys`, { name: "Verifier extra key 1" });
   await postJson(`${serverUrl}/v1/apps/${thirdPartyAppOne.app_id}/api-keys`, { name: "Verifier extra key 2" });
+  assertAppDetail(await requestJson(`${serverUrl}/v1/apps/${thirdPartyAppOne.app_id}`), thirdPartyAppOne.app_id);
   await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: workspaceId,
     app_id: thirdPartyAppOne.app_id,
@@ -135,6 +145,7 @@ try {
   }
 
   const messageDetail = await requestJson(`${serverUrl}/v1/messages/${messageId}`);
+  assertMessageDetail(messageDetail, messageId, [prompt]);
   assertNoPlaintext(messageDetail, "message detail");
   const statuses = messageDetail.status_events.map((event: { status: string }) => event.status);
   for (const required of ["created", "validated", "delivered", "received", "processing", "completed"]) {
@@ -142,6 +153,14 @@ try {
   }
   if (!messageDetail.crypto?.sender_key_id || !messageDetail.crypto?.recipient_key_id) {
     throw new Error("message detail did not include crypto metadata");
+  }
+  const messageEvents = await requestJson(`${serverUrl}/v1/messages/${messageId}/events?cursor=0`);
+  if (messageEvents.message_id !== messageId || !Array.isArray(messageEvents.events)) {
+    throw new Error("message events route returned unexpected shape");
+  }
+  if ("limit" in messageEvents) throw new Error("message events route should not share list pagination limit shape");
+  if (typeof messageEvents.cursor !== "number" || typeof messageEvents.next_cursor !== "string") {
+    throw new Error("message events route missing cursor fields");
   }
 
   const audit = await requestJson(`${serverUrl}/v1/audit-events?message_id=${messageId}`);
@@ -160,6 +179,20 @@ try {
   await expectPagedList(`${serverUrl}/v1/authorized-apps`, "authorized_apps", true);
   await expectPagedList(`${serverUrl}/v1/apps/${thirdPartyAppOne.app_id}/api-keys`, "api_keys", true);
   await expectPagedList(`${serverUrl}/v1/plugins`, "plugins");
+  assertPluginDetail(await requestJson(`${serverUrl}/v1/plugins/hermes`), "hermes");
+  assertPluginDetail(await requestJson(`${serverUrl}/v1/plugins/hermes/versions/0.1.0`), "hermes", "0.1.0");
+  assertPluginPolicy(await requestJson(`${serverUrl}/v1/workspace/plugin-policy`));
+  const patchedPluginPolicy = await patchJson(`${serverUrl}/v1/workspace/plugin-policy`, {
+    require_signature: true,
+    allowed_trust_levels: ["official"],
+    allowed_plugins: ["hermes"],
+    blocked_plugins: ["community-unsigned"],
+    require_approval_for_permission_increase: true,
+  });
+  assertPluginPolicy(patchedPluginPolicy);
+  if (!patchedPluginPolicy.policy.allowed_plugins.includes("hermes")) {
+    throw new Error("plugin policy PATCH response did not preserve allowed_plugins");
+  }
 
   await postJson(`${serverUrl}/v1/grants/${grantId}/revoke`, {});
   await expectSendDenied("app_001", "hermes.task.create", "M2_GRANT_REVOKED_SECRET", "grant denied");
