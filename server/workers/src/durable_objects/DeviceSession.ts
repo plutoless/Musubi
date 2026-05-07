@@ -129,6 +129,18 @@ interface AuditEventRecord {
   created_at: string;
 }
 
+interface MessageStatusEventRecord {
+  id: string;
+  message_id: string;
+  workspace_id: string;
+  status: MessageState;
+  stage?: string;
+  error_code?: string;
+  error_message?: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
 interface DevicePluginCapabilityRecord {
   id: string;
   workspace_id: string;
@@ -282,7 +294,7 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/developers" && request.method === "GET") {
-      return this.handleListDevelopers();
+      return this.handleListDevelopers(url);
     }
 
     const developerMatch = url.pathname.match(/^\/v1\/developers\/([^/]+)$/);
@@ -295,7 +307,7 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/publishers" && request.method === "GET") {
-      return this.handleListPublishers();
+      return this.handleListPublishers(url);
     }
 
     const publisherMatch = url.pathname.match(/^\/v1\/publishers\/([^/]+)$/);
@@ -359,11 +371,11 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/authorized-apps" && request.method === "GET") {
-      return this.handleListAuthorizedApps();
+      return this.handleListAuthorizedApps(url);
     }
 
     if (url.pathname === "/v1/plugins" && request.method === "GET") {
-      return Response.json({ plugins: HOSTED_PLUGIN_NAMES.map((name) => registryPluginResponse(name)?.plugin).filter(Boolean) });
+      return this.handleListPlugins(url);
     }
 
     const pluginVersionMatch = url.pathname.match(/^\/v1\/plugins\/([^/]+)\/versions\/([^/]+)$/);
@@ -410,7 +422,7 @@ export class DeviceSession {
       return this.handleCreateAppApiKey(request, apiKeyMatch[1]);
     }
     if (apiKeyMatch && request.method === "GET") {
-      return this.handleListAppApiKeys(apiKeyMatch[1]);
+      return this.handleListAppApiKeys(apiKeyMatch[1], url);
     }
 
     const appMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)$/);
@@ -447,7 +459,7 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/app/devices" && request.method === "GET") {
-      return this.handleListGrantedAppDevices(request);
+      return this.handleListGrantedAppDevices(request, url);
     }
 
     const appDeviceKeyMatch = url.pathname.match(/^\/v1\/app\/devices\/([^/]+)\/public-key$/);
@@ -456,21 +468,11 @@ export class DeviceSession {
     }
 
     if (url.pathname === "/v1/audit-events" && request.method === "GET") {
-      return this.handleGetAuditEvents(url.searchParams.get("message_id"));
+      return this.handleGetAuditEvents(url);
     }
 
     if (url.pathname === "/v1/device-plugin-capabilities" && request.method === "GET") {
-      const sql = this.neon();
-      if (sql) {
-        const capabilities = await sql`
-          select *
-          from device_plugin_capabilities
-          order by reported_at desc
-          limit 200
-        ` as DevicePluginCapabilityRecord[];
-        return Response.json({ capabilities });
-      }
-      return Response.json({ capabilities: await this.list<DevicePluginCapabilityRecord>("device_plugin_capabilities") });
+      return this.handleListDevicePluginCapabilities(url);
     }
 
     const connectMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/connect$/);
@@ -581,88 +583,135 @@ export class DeviceSession {
   private async handleListApps(url: URL): Promise<Response> {
     const sql = this.neon();
     if (!sql) {
-      const apps = await this.list<AppRecord>("apps");
-      return Response.json({ apps });
+      let apps = await this.list<AppRecord>("apps");
+      const type = url.searchParams.get("type");
+      const status = url.searchParams.get("status");
+      const workspaceId = url.searchParams.get("workspace_id");
+      if (type) apps = apps.filter((app) => app.type === type);
+      if (status) apps = apps.filter((app) => app.status === status);
+      if (workspaceId) apps = apps.filter((app) => app.workspace_id === workspaceId);
+      apps = apps.sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const { page, next_cursor, limit } = paginateList(apps, url, (app) => app.id);
+      return Response.json({ apps: page, next_cursor, limit });
     }
-    let rows = await sql`
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url);
+    const type = url.searchParams.get("type");
+    const status = url.searchParams.get("status");
+    const workspaceId = url.searchParams.get("workspace_id");
+    const rows = await sql`
       select
         apps.*,
         publisher_profiles.display_name as publisher_display_name,
         publisher_profiles.verification_status as publisher_verification_status
       from apps
       left join publisher_profiles on publisher_profiles.id = apps.publisher_id
-      order by apps.created_at desc
-      limit 100
+      where (${type}::text is null or apps.type = ${type})
+        and (${status}::text is null or apps.status = ${status})
+        and (${workspaceId}::text is null or apps.workspace_id = ${workspaceId})
+        and (${cursor.created_at}::timestamptz is null or (apps.created_at, apps.id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by apps.created_at desc, apps.id desc
+      limit ${limit + 1}
     ` as any[];
-    const type = url.searchParams.get("type");
-    if (type) rows = rows.filter((row) => row.type === type);
-    const appIds = rows.map((row) => row.id).filter(Boolean);
-    if (appIds.length === 0) return Response.json({ apps: [], next_cursor: null });
+    const pageRows = rows.slice(0, limit);
+    const appIds = pageRows.map((row) => row.id).filter(Boolean);
+    if (appIds.length === 0) return Response.json({ apps: [], next_cursor: null, limit });
 
-    const publisherIds = [...new Set(rows.map((row) => row.publisher_id).filter(Boolean))] as string[];
-    const [publishers, declarations, grants] = await Promise.all([
-      publisherIds.length
-        ? sql`select * from publisher_profiles where id = any(${publisherIds}::text[])` as Promise<PublisherRecord[]>
-        : Promise.resolve([]),
-      sql`
-        select *
-        from app_permission_declarations
-        where app_id = any(${appIds}::text[])
-        order by created_at asc
-      ` as Promise<PermissionDeclarationRecord[]>,
-      sql`
-        select *
-        from app_device_channel_grants
-        where app_id = any(${appIds}::text[])
-        order by created_at desc
-      ` as Promise<GrantRecord[]>,
-    ]);
-    const publishersById = new Map(publishers.map((publisher) => [publisher.id, publisher]));
-    const declarationsByAppId = groupBy(declarations, (declaration) => declaration.app_id);
-    const grantsByAppId = groupBy(grants, (grant) => grant.app_id);
-    const apps = rows.map((app) => {
-      const activeGrants = (grantsByAppId.get(app.id) ?? []).filter((grant) => !grant.revoked_at);
+    const grantCounts = await sql`
+      select
+        app_id,
+        count(distinct device_id)::int as authorized_device_count,
+        count(distinct allowed.channel)::int as allowed_channel_count
+      from app_device_channel_grants
+      cross join lateral unnest(allowed_channels) as allowed(channel)
+      where app_id = any(${appIds}::text[])
+        and revoked_at is null
+      group by app_id
+    ` as Array<{ app_id: string; authorized_device_count: number; allowed_channel_count: number }>;
+    const countsByAppId = new Map(grantCounts.map((row) => [row.app_id, row]));
+    const apps = pageRows.map((app) => {
+      const counts = countsByAppId.get(app.id);
       return {
         ...app,
-        publisher: app.publisher_id ? publishersById.get(app.publisher_id) : undefined,
-        permission_declarations: declarationsByAppId.get(app.id) ?? [],
-        authorized_device_count: new Set(activeGrants.map((grant) => grant.device_id)).size,
-        allowed_channel_count: new Set(activeGrants.flatMap((grant) => grant.allowed_channels ?? [])).size,
+        publisher: app.publisher_id
+          ? {
+              id: app.publisher_id,
+              display_name: app.publisher_display_name,
+              verification_status: app.publisher_verification_status,
+            }
+          : undefined,
+        permission_declarations: [],
+        authorized_device_count: counts?.authorized_device_count ?? 0,
+        allowed_channel_count: counts?.allowed_channel_count ?? 0,
       };
     });
-    return Response.json({ apps, next_cursor: null });
+    return Response.json({ apps, next_cursor: nextKeysetCursor(pageRows, rows.length, limit), limit });
   }
 
   private async handleListDevices(url: URL): Promise<Response> {
     const sql = this.neon();
     if (!sql) {
-      const devices = await this.list<DeviceRecord>("devices");
-      return Response.json({ devices, next_cursor: null });
+      let devices = await this.list<DeviceRecord>("devices");
+      const workspaceId = url.searchParams.get("workspace_id");
+      const status = url.searchParams.get("status");
+      if (workspaceId) devices = devices.filter((device) => device.workspace_id === workspaceId);
+      if (status) devices = devices.filter((device) => device.status === status);
+      devices = devices.sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const { page, next_cursor, limit } = paginateList(devices, url, (device) => device.id);
+      return Response.json({ devices: page, next_cursor, limit });
     }
-    let rows = await sql`
-      select *
-      from devices
-      order by created_at desc
-      limit 100
-    ` as any[];
+    const limit = queryLimit(url, 100, 500);
     const workspaceId = url.searchParams.get("workspace_id");
     const status = url.searchParams.get("status");
-    if (workspaceId) rows = rows.filter((row) => row.workspace_id === workspaceId);
-    if (status) rows = rows.filter((row) => row.status === status);
+    const cursor = keysetCursor(url);
+    const rows = await sql`
+      with page_devices as (
+        select *
+        from devices
+        where (${workspaceId}::text is null or workspace_id = ${workspaceId})
+          and (${status}::text is null or status = ${status})
+          and (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+        order by created_at desc, id desc
+        limit ${limit + 1}
+      ),
+      capability_counts as (
+        select device_id, count(distinct plugin_name)::int as plugin_count
+        from device_plugin_capabilities
+        where device_id in (select id from page_devices)
+        group by device_id
+      ),
+      grant_counts as (
+        select device_id, count(distinct app_id)::int as authorized_app_count
+        from app_device_channel_grants
+        where device_id in (select id from page_devices)
+          and revoked_at is null
+        group by device_id
+      )
+      select
+        page_devices.*,
+        coalesce(capability_counts.plugin_count, 0)::int as plugin_count,
+        coalesce(grant_counts.authorized_app_count, 0)::int as authorized_app_count
+      from page_devices
+      left join capability_counts on capability_counts.device_id = page_devices.id
+      left join grant_counts on grant_counts.device_id = page_devices.id
+      order by page_devices.created_at desc, page_devices.id desc
+    ` as any[];
+    const pageRows = rows.slice(0, limit);
     return Response.json({
-      devices: rows.map((device) => ({
+      devices: pageRows.map((device) => ({
         id: device.id,
         name: device.display_name ?? device.name,
         status: device.status,
         platform: device.platform,
         cli_version: device.cli_version,
-        plugin_count: 0,
-        authorized_app_count: 0,
+        plugin_count: device.plugin_count,
+        authorized_app_count: device.authorized_app_count,
         last_seen_at: device.last_seen_at,
         last_capability_report_at: device.last_capability_report_at,
         created_at: device.created_at,
       })),
-      next_cursor: null,
+      next_cursor: nextKeysetCursor(pageRows, rows.length, limit),
+      limit,
     });
   }
 
@@ -691,16 +740,30 @@ export class DeviceSession {
     return Response.json({ developer });
   }
 
-  private async handleListDevelopers(): Promise<Response> {
-    const sql = this.neonRequired();
-    if (sql instanceof Response) return sql;
+  private async handleListDevelopers(url: URL): Promise<Response> {
+    const sql = this.neon();
+    if (!sql) {
+      const limit = queryLimit(url, 100, 500);
+      const status = url.searchParams.get("status");
+      let developers = await this.list<DeveloperRecord>("developer_accounts");
+      if (status) developers = developers.filter((developer) => developer.status === status);
+      developers = developers.sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const { page, next_cursor, limit: pageLimit } = paginateList(developers, url, (developer) => developer.id, limit);
+      return Response.json({ developers: page, next_cursor, limit: pageLimit });
+    }
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url);
+    const status = url.searchParams.get("status");
     const developers = await sql`
       select *
       from developer_accounts
-      order by created_at desc
-      limit 100
+      where (${status}::text is null or status = ${status})
+        and (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by created_at desc, id desc
+      limit ${limit + 1}
     ` as DeveloperRecord[];
-    return Response.json({ developers });
+    const page = developers.slice(0, limit);
+    return Response.json({ developers: page, next_cursor: nextKeysetCursor(page, developers.length, limit), limit });
   }
 
   private async handleUpdateDeveloper(request: Request, developerId: string): Promise<Response> {
@@ -774,16 +837,30 @@ export class DeviceSession {
     return Response.json({ publisher });
   }
 
-  private async handleListPublishers(): Promise<Response> {
-    const sql = this.neonRequired();
-    if (sql instanceof Response) return sql;
+  private async handleListPublishers(url: URL): Promise<Response> {
+    const sql = this.neon();
+    if (!sql) {
+      const limit = queryLimit(url, 100, 500);
+      const verificationStatus = url.searchParams.get("verification_status");
+      let publishers = await this.list<PublisherRecord>("publisher_profiles");
+      if (verificationStatus) publishers = publishers.filter((publisher) => publisher.verification_status === verificationStatus);
+      publishers = publishers.sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const { page, next_cursor, limit: pageLimit } = paginateList(publishers, url, (publisher) => publisher.id, limit);
+      return Response.json({ publishers: page, next_cursor, limit: pageLimit });
+    }
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url);
+    const verificationStatus = url.searchParams.get("verification_status");
     const publishers = await sql`
       select *
       from publisher_profiles
-      order by created_at desc
-      limit 100
+      where (${verificationStatus}::text is null or verification_status = ${verificationStatus})
+        and (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by created_at desc, id desc
+      limit ${limit + 1}
     ` as PublisherRecord[];
-    return Response.json({ publishers });
+    const page = publishers.slice(0, limit);
+    return Response.json({ publishers: page, next_cursor: nextKeysetCursor(page, publishers.length, limit), limit });
   }
 
   private async handleUpdatePublisher(request: Request, publisherId: string): Promise<Response> {
@@ -905,18 +982,31 @@ export class DeviceSession {
     return Response.json({ api_key: created.secret, key: this.appApiKeyView(created.key) });
   }
 
-  private async handleListAppApiKeys(appId: string): Promise<Response> {
-    const sql = this.neonRequired();
-    if (sql instanceof Response) return sql;
+  private async handleListAppApiKeys(appId: string, url: URL): Promise<Response> {
+    const sql = this.neon();
+    const limit = queryLimit(url, 100, 500);
+    if (!sql) {
+      const app = await this.getMapItem<AppRecord>("apps", appId);
+      if (!app) return Response.json({ error: "not found" }, { status: 404 });
+      const keys = (await this.list<AppApiKeyRecord>("app_api_keys"))
+        .filter((key) => key.app_id === appId)
+        .sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const { page, next_cursor, limit: pageLimit } = paginateList(keys, url, (key) => key.id, limit);
+      return Response.json({ api_keys: page, next_cursor, limit: pageLimit });
+    }
     const app = await this.hostedApp(appId);
     if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const cursor = keysetCursor(url);
     const keys = await sql`
       select id, app_id, name, prefix, status, created_at, last_used_at, revoked_at, revoked_by
       from app_api_keys
       where app_id = ${appId}
-      order by created_at asc
+        and (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by created_at desc, id desc
+      limit ${limit + 1}
     ` as AppApiKeyRecord[];
-    return Response.json({ api_keys: keys });
+    const page = keys.slice(0, limit);
+    return Response.json({ api_keys: page, next_cursor: nextKeysetCursor(page, keys.length, limit), limit });
   }
 
   private async handleCreatePermissionDeclaration(request: Request, appId: string): Promise<Response> {
@@ -1199,20 +1289,54 @@ export class DeviceSession {
         const value = url.searchParams.get(field);
         if (value) grants = grants.filter((grant) => grant[field] === value);
       }
-      return Response.json({ grants, next_cursor: null });
+      grants = grants.sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const { page, next_cursor, limit } = paginateList(grants, url, (grant) => grant.id);
+      return Response.json({ grants: page, next_cursor, limit });
     }
-    let rows = await sql`
-      select *
-      from app_device_channel_grants
-      order by created_at desc
-      limit 100
-    ` as GrantRecord[];
-    for (const field of ["app_id", "device_id", "workspace_id"] as const) {
-      const value = url.searchParams.get(field);
-      if (value) rows = rows.filter((grant) => grant[field] === value);
-    }
-    const grants = await Promise.all(rows.map((grant) => this.grantView(grant)));
-    return Response.json({ grants, next_cursor: null });
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url);
+    const appId = url.searchParams.get("app_id");
+    const deviceId = url.searchParams.get("device_id");
+    const workspaceId = url.searchParams.get("workspace_id");
+    const rows = await sql`
+      select
+        grants.*,
+        apps.name as app_name,
+        apps.type as app_type,
+        apps.status as app_status,
+        devices.name as device_name,
+        devices.status as device_status,
+        devices.platform as device_platform
+      from app_device_channel_grants grants
+      left join apps on apps.id = grants.app_id
+      left join devices on devices.id = grants.device_id
+      where (${appId}::text is null or grants.app_id = ${appId})
+        and (${deviceId}::text is null or grants.device_id = ${deviceId})
+        and (${workspaceId}::text is null or grants.workspace_id = ${workspaceId})
+        and (${cursor.created_at}::timestamptz is null or (grants.created_at, grants.id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by grants.created_at desc, grants.id desc
+      limit ${limit + 1}
+    ` as any[];
+    const pageRows = rows.slice(0, limit);
+    const grants = pageRows.map((grant) => ({
+      id: grant.id,
+      workspace_id: grant.workspace_id,
+      app_id: grant.app_id,
+      device_id: grant.device_id,
+      name: grant.name,
+      description: grant.description,
+      allowed_channels: grant.allowed_channels,
+      queueing_allowed: grant.queueing_allowed,
+      created_from_consent_request_id: grant.created_from_consent_request_id,
+      created_at: grant.created_at,
+      updated_at: grant.updated_at,
+      revoked_at: grant.revoked_at,
+      revoked_by: grant.revoked_by,
+      status: grant.revoked_at ? "revoked" : "active",
+      app: grant.app_id ? { id: grant.app_id, name: grant.app_name, type: grant.app_type, status: grant.app_status } : undefined,
+      device: grant.device_id ? { id: grant.device_id, name: grant.device_name, status: grant.device_status, platform: grant.device_platform } : undefined,
+    }));
+    return Response.json({ grants, next_cursor: nextKeysetCursor(pageRows, rows.length, limit), limit });
   }
 
   private async handlePermissionCheck(request: Request): Promise<Response> {
@@ -1303,20 +1427,67 @@ export class DeviceSession {
     return Response.json({ grant_id: grant.id, status: "revoked" });
   }
 
-  private async handleListAuthorizedApps(): Promise<Response> {
-    const sql = this.neonRequired();
-    if (sql instanceof Response) return sql;
+  private async handleListAuthorizedApps(url: URL): Promise<Response> {
+    const sql = this.neon();
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url);
+    if (!sql) {
+      let apps = await this.list<AppRecord>("apps");
+      apps = apps.filter((app) => app.type === "third_party");
+      apps = apps.sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const pageResult = paginateList(apps, url, (app) => app.id, limit);
+      const pageApps = pageResult.page;
+      if (pageApps.length === 0) return Response.json({ authorized_apps: [], apps: [], next_cursor: null, limit });
+
+      const publishers = await this.list<PublisherRecord>("publisher_profiles");
+      const publishersById = new Map(publishers.map((publisher) => [publisher.id, publisher]));
+      const devices = await this.list<DeviceRecord>("devices");
+      const devicesById = new Map(devices.map((device) => [device.id, device]));
+      const allGrants = await this.list<GrantRecord>("grants");
+      const appIds = new Set(pageApps.map((app) => app.id));
+      const appGrants = allGrants.filter((grant) => appIds.has(grant.app_id));
+      const grantsByAppId = groupBy(appGrants, (grant) => grant.app_id);
+      const rows = [];
+      for (const app of pageApps) {
+        const grants = grantsByAppId.get(app.id) ?? [];
+        const activeGrants = grants.filter((grant) => !grant.revoked_at);
+        rows.push({
+          app: {
+            ...app,
+            publisher: app.publisher_id ? publishersById.get(app.publisher_id) : undefined,
+            permission_declarations: [],
+            authorized_device_count: new Set(activeGrants.map((grant) => grant.device_id)).size,
+            allowed_channel_count: new Set(activeGrants.flatMap((grant) => grant.allowed_channels ?? [])).size,
+          },
+          grants: grants.map((grant) => ({
+            ...grant,
+            status: grant.revoked_at ? "revoked" : "active",
+            app,
+            device: devicesById.get(grant.device_id),
+          })),
+          reports: [],
+        });
+      }
+      return Response.json({
+        authorized_apps: rows,
+        apps: rows,
+        next_cursor: pageResult.next_cursor,
+        limit: pageResult.limit,
+      });
+    }
     const apps = await sql`
       select *
       from apps
       where type = 'third_party'
-      order by created_at desc
-      limit 100
+        and (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by created_at desc, id desc
+      limit ${limit + 1}
     ` as AppRecord[];
-    const appIds = apps.map((app) => app.id);
-    if (appIds.length === 0) return Response.json({ authorized_apps: [], apps: [] });
+    const pageApps = apps.slice(0, limit);
+    const appIds = pageApps.map((app) => app.id);
+    if (appIds.length === 0) return Response.json({ authorized_apps: [], apps: [], next_cursor: null, limit });
 
-    const publisherIds = [...new Set(apps.map((app) => app.publisher_id).filter(Boolean))] as string[];
+    const publisherIds = [...new Set(pageApps.map((app) => app.publisher_id).filter(Boolean))] as string[];
     const [publishers, declarations, grants, reports] = await Promise.all([
       publisherIds.length
         ? sql`select * from publisher_profiles where id = any(${publisherIds}::text[])` as Promise<PublisherRecord[]>
@@ -1353,7 +1524,7 @@ export class DeviceSession {
     const reportsByAppId = groupBy(reports, (report) => report.app_id);
 
     const rows = [];
-    for (const app of apps) {
+    for (const app of pageApps) {
       const appGrants = grantsByAppId.get(app.id) ?? [];
       const activeGrants = appGrants.filter((grant) => !grant.revoked_at);
       const appView = {
@@ -1374,7 +1545,21 @@ export class DeviceSession {
         reports: reportsByAppId.get(app.id) ?? [],
       });
     }
-    return Response.json({ authorized_apps: rows, apps: rows });
+    return Response.json({
+      authorized_apps: rows,
+      apps: rows,
+      next_cursor: nextKeysetCursor(pageApps, apps.length, limit),
+      limit,
+    });
+  }
+
+  private handleListPlugins(url: URL): Response {
+    const plugins = HOSTED_PLUGIN_NAMES
+      .map((name) => registryPluginResponse(name)?.plugin)
+      .filter(Boolean)
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const { page, next_cursor, limit } = paginateList(plugins, url, (plugin) => plugin.name);
+    return Response.json({ plugins: page, next_cursor, limit });
   }
 
   private async handleResolvePlugin(url: URL): Promise<Response> {
@@ -1624,6 +1809,7 @@ export class DeviceSession {
     };
     await this.putMapItem("messages", envelope.message_id, stored);
     await this.persistMessage(stored);
+    await this.persistMessageStatusEvent(stored, "created");
     await this.audit("app", envelope.app_id, "message.created", {
       workspace_id: envelope.workspace_id,
       app_id: envelope.app_id,
@@ -1673,27 +1859,170 @@ export class DeviceSession {
   }
 
   private async handleGetMessage(messageId: string): Promise<Response> {
+    const sql = this.neon();
+    if (sql) {
+      const row = (await sql`
+        select
+          messages.*,
+          apps.name as app_name,
+          devices.name as device_name
+        from messages
+        left join apps on apps.id = messages.app_id
+        left join devices on devices.id = messages.device_id
+        where messages.id = ${messageId}
+        limit 1
+      ` as any[])[0];
+      if (!row) return Response.json({ error: "not found" }, { status: 404 });
+      const [statusEvents, auditEvents] = await Promise.all([
+        sql`
+          select *
+          from message_status_events
+          where message_id = ${messageId}
+          order by created_at asc
+          limit 200
+        ` as Promise<MessageStatusEventRecord[]>,
+        sql`
+          select *
+          from audit_events
+          where message_id = ${messageId}
+          order by created_at desc
+          limit 100
+        ` as Promise<AuditEventRecord[]>,
+      ]);
+      const crypto = messageCryptoView(row);
+      const message = {
+        id: row.id,
+        message_id: row.id,
+        workspace_id: row.workspace_id,
+        app_id: row.app_id,
+        app_name: row.app_name,
+        device_id: row.device_id,
+        device_name: row.device_name,
+        channel: row.channel,
+        status: row.status,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        expires_at: row.expires_at,
+        duration_ms: null,
+      };
+      return Response.json({
+        message_id: row.id,
+        status: row.status,
+        history: statusEvents.map((event) => event.status),
+        result: undefined,
+        result_events: [],
+        message,
+        status_events: statusEvents,
+        audit_events: auditEvents,
+        crypto,
+      });
+    }
     const item = await this.getMapItem<StoredMessage>("messages", messageId);
     if (!item) return Response.json({ error: "not found" }, { status: 404 });
+    const statusEvents = item.history.map((status, index) => ({
+      id: `${item.envelope.message_id}_status_${String(index + 1).padStart(3, "0")}_${status}`,
+      message_id: item.envelope.message_id,
+      workspace_id: item.envelope.workspace_id,
+      status,
+      stage: status,
+      metadata: {},
+      created_at: item.envelope.created_at ?? new Date().toISOString(),
+    }));
+    const auditEvents = (await this.list<AuditEventRecord>("audit_events"))
+      .filter((event) => event.message_id === messageId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, 100);
     return Response.json({
       message_id: item.envelope.message_id,
       status: item.status,
       history: item.history,
       result: item.result,
       result_events: item.result_events ?? [],
+      message: {
+        id: item.envelope.message_id,
+        message_id: item.envelope.message_id,
+        workspace_id: item.envelope.workspace_id,
+        app_id: item.envelope.app_id,
+        device_id: item.envelope.device_id,
+        channel: item.envelope.channel,
+        status: item.status,
+        created_at: item.envelope.created_at,
+        updated_at: item.envelope.created_at,
+        duration_ms: null,
+      },
+      status_events: statusEvents,
+      audit_events: auditEvents,
+      crypto: messageCryptoView({ ...item.envelope, id: item.envelope.message_id }),
     });
   }
 
   private async handleListMessages(url: URL): Promise<Response> {
+    const sql = this.neon();
+    if (sql) {
+      const appId = url.searchParams.get("app_id");
+      const deviceId = url.searchParams.get("device_id");
+      const channel = url.searchParams.get("channel");
+      const status = url.searchParams.get("status");
+      const limit = queryLimit(url, 100, 500);
+      const cursor = keysetCursor(url);
+      const rows = await sql`
+        select
+          messages.id,
+          messages.id as message_id,
+          messages.workspace_id,
+          messages.app_id,
+          apps.name as app_name,
+          messages.device_id,
+          devices.name as device_name,
+          messages.channel,
+          messages.status,
+          messages.created_at,
+          messages.updated_at,
+          messages.expires_at,
+          messages.ciphertext,
+          messages.crypto
+        from messages
+        left join apps on apps.id = messages.app_id
+        left join devices on devices.id = messages.device_id
+        where (${appId}::text is null or messages.app_id = ${appId})
+          and (${deviceId}::text is null or messages.device_id = ${deviceId})
+          and (${channel}::text is null or messages.channel = ${channel})
+          and (${status}::text is null or messages.status = ${status})
+          and (${cursor.created_at}::timestamptz is null or (messages.created_at, messages.id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+        order by messages.created_at desc, messages.id desc
+        limit ${limit + 1}
+      ` as any[];
+      const pageRows = rows.slice(0, limit);
+      return Response.json({
+        messages: pageRows.map((row) => ({
+          id: row.id,
+          message_id: row.message_id,
+          workspace_id: row.workspace_id,
+          app_id: row.app_id,
+          app_name: row.app_name,
+          device_id: row.device_id,
+          device_name: row.device_name,
+          channel: row.channel,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          expires_at: row.expires_at,
+          duration_ms: null,
+          crypto: messageCryptoView(row),
+        })),
+        next_cursor: nextKeysetCursor(pageRows, rows.length, limit),
+        limit,
+      });
+    }
     let messages = await this.list<StoredMessage>("messages");
     for (const field of ["app_id", "device_id", "channel", "status"] as const) {
       const value = url.searchParams.get(field);
       if (!value) continue;
       messages = messages.filter((item) => field === "status" ? item.status === value : item.envelope[field] === value);
     }
+    const limit = queryLimit(url, 100, 500);
     const rows = messages
       .sort((a, b) => (b.envelope.created_at ?? "").localeCompare(a.envelope.created_at ?? ""))
-      .slice(0, 100)
       .map((item) => ({
         id: item.envelope.message_id,
         message_id: item.envelope.message_id,
@@ -1713,7 +2042,8 @@ export class DeviceSession {
           payload_size: item.envelope.ciphertext.length,
         },
       }));
-    return Response.json({ messages: rows, next_cursor: null });
+    const page = paginateList(rows, url, (message) => message.id, 100);
+    return Response.json({ messages: page.page, next_cursor: page.next_cursor, limit: page.limit });
   }
 
   private async handleGetMessageEvents(messageId: string, url: URL): Promise<Response> {
@@ -1741,21 +2071,107 @@ export class DeviceSession {
     return Response.json({ message_id: messageId, status: "cancelled" });
   }
 
-  private async handleGetAuditEvents(messageId: string | null): Promise<Response> {
+  private async handleGetAuditEvents(url: URL): Promise<Response> {
     const sql = this.neon();
-    const events = sql
-      ? await sql`select * from audit_events order by created_at desc limit 100` as AuditEventRecord[]
-      : await this.list<AuditEventRecord>("audit_events");
-    return Response.json({
-      audit_events: messageId ? events.filter((event) => event.message_id === messageId) : events,
-    });
+    const messageId = url.searchParams.get("message_id");
+    const appId = url.searchParams.get("app_id");
+    const deviceId = url.searchParams.get("device_id");
+    const eventType = url.searchParams.get("event_type");
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url);
+    if (!sql) {
+      const events = (await this.list<AuditEventRecord>("audit_events"))
+        .filter((event) => !messageId || event.message_id === messageId)
+        .filter((event) => !appId || event.app_id === appId)
+        .filter((event) => !deviceId || event.device_id === deviceId)
+        .filter((event) => !eventType || event.event_type === eventType)
+        .sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const page = paginateList(events, url, (event) => event.id, 100);
+      return Response.json({ audit_events: page.page, next_cursor: page.next_cursor, limit: page.limit });
+    }
+    const events = await sql`
+      select *
+      from audit_events
+      where (${messageId}::text is null or message_id = ${messageId})
+        and (${appId}::text is null or app_id = ${appId})
+        and (${deviceId}::text is null or device_id = ${deviceId})
+        and (${eventType}::text is null or event_type = ${eventType})
+        and (${cursor.created_at}::timestamptz is null or (created_at, id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by created_at desc, id desc
+      limit ${limit + 1}
+    ` as AuditEventRecord[];
+    const page = events.slice(0, limit);
+    return Response.json({ audit_events: page, next_cursor: nextKeysetCursor(page, events.length, limit), limit });
   }
 
-  private async handleListGrantedAppDevices(request: Request): Promise<Response> {
+  private async handleListDevicePluginCapabilities(url: URL): Promise<Response> {
+    const sql = this.neon();
+    const deviceId = url.searchParams.get("device_id");
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url, "reported_at");
+    if (sql) {
+      const capabilities = await sql`
+        select *
+        from device_plugin_capabilities
+        where (${deviceId}::text is null or device_id = ${deviceId})
+          and (${cursor.reported_at}::timestamptz is null or (reported_at, id) < (${cursor.reported_at}::timestamptz, ${cursor.id}::text))
+        order by reported_at desc, id desc
+        limit ${limit + 1}
+      ` as DevicePluginCapabilityRecord[];
+      const page = capabilities.slice(0, limit);
+      return Response.json({ capabilities: page, next_cursor: nextKeysetCursor(page, capabilities.length, limit, "reported_at"), limit });
+    }
+    const allCapabilities = (await this.list<DevicePluginCapabilityRecord>("device_plugin_capabilities"))
+      .filter((capability) => !deviceId || capability.device_id === deviceId)
+      .sort((a, b) => `${b.reported_at}:${b.id}`.localeCompare(`${a.reported_at}:${a.id}`));
+    const page = paginateList(allCapabilities, url, (capability) => capability.id, 100);
+    return Response.json({ capabilities: page.page, next_cursor: page.next_cursor, limit: page.limit });
+  }
+
+  private async handleListGrantedAppDevices(request: Request, url: URL): Promise<Response> {
     const auth = await this.authenticateAppRequest(request);
     if (auth instanceof Response) return auth;
-    const sql = this.neonRequired();
-    if (sql instanceof Response) return sql;
+    const limit = queryLimit(url, 100, 500);
+    const cursor = keysetCursor(url);
+    const sql = this.neon();
+    if (!sql) {
+      const grants = (await this.list<GrantRecord>("grants"))
+        .filter((grant) => grant.app_id === auth.app.id && !grant.revoked_at)
+        .filter((grant) => grant.device_id)
+        .sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const devices = await this.list<DeviceRecord>("devices");
+      const activeDeviceIds = new Set(devices.filter((device) => device.status !== "revoked" && !device.revoked_at).map((device) => device.id));
+      const byDeviceId = new Map<string, GrantRecord>();
+      for (const grant of grants) {
+        if (!activeDeviceIds.has(grant.device_id)) continue;
+        const existing = byDeviceId.get(grant.device_id);
+        if (!existing || existing.created_at < grant.created_at) byDeviceId.set(grant.device_id, grant);
+      }
+      const rows = devices
+        .filter((device) => byDeviceId.has(device.id))
+        .map((device) => {
+          const grant = byDeviceId.get(device.id)!;
+          return {
+            id: device.id,
+            name: device.name,
+            status: device.status,
+            platform: device.platform,
+            workspace_id: device.workspace_id,
+            allowed_channels: grant.allowed_channels,
+            queueing_allowed: grant.queueing_allowed,
+            last_seen_at: device.last_seen_at,
+            last_capability_report_at: device.last_capability_report_at,
+            created_at: device.created_at,
+          };
+        })
+        .sort((a, b) => `${b.created_at}:${b.id}`.localeCompare(`${a.created_at}:${a.id}`));
+      const pageRows = paginateList(rows, url, (row) => row.id);
+      return Response.json({
+        devices: pageRows.page,
+        next_cursor: pageRows.next_cursor,
+        limit: pageRows.limit,
+      });
+    }
     const rows = await sql`
       select
         devices.id,
@@ -1763,6 +2179,7 @@ export class DeviceSession {
         devices.status,
         devices.platform,
         devices.workspace_id,
+        devices.created_at,
         devices.last_seen_at,
         devices.last_capability_report_at,
         app_device_channel_grants.allowed_channels,
@@ -1773,10 +2190,13 @@ export class DeviceSession {
         and app_device_channel_grants.revoked_at is null
         and devices.revoked_at is null
         and devices.status != 'revoked'
-      order by devices.created_at asc
+        and (${cursor.created_at}::timestamptz is null or (devices.created_at, devices.id) < (${cursor.created_at}::timestamptz, ${cursor.id}::text))
+      order by devices.created_at desc, devices.id desc
+      limit ${limit + 1}
     ` as any[];
+    const pageRows = rows.slice(0, limit);
     return Response.json({
-      devices: rows.map((row) => ({
+      devices: pageRows.map((row) => ({
         id: row.id,
         name: row.name,
         status: row.status,
@@ -1786,7 +2206,10 @@ export class DeviceSession {
         queueing_allowed: row.queueing_allowed,
         last_seen_at: row.last_seen_at,
         last_capability_report_at: row.last_capability_report_at,
+        created_at: row.created_at,
       })),
+      next_cursor: nextKeysetCursor(pageRows, rows.length, limit),
+      limit,
     });
   }
 
@@ -2070,6 +2493,7 @@ export class DeviceSession {
     item.history.push(status);
     await this.putMapItem("messages", messageId, item);
     await this.persistMessage(item);
+    await this.persistMessageStatusEvent(item, status);
     await this.audit("system", undefined, `message.${status}`, {
       workspace_id: item.envelope.workspace_id,
       app_id: item.envelope.app_id,
@@ -2276,6 +2700,7 @@ export class DeviceSession {
         status,
         visible_metadata,
         ciphertext,
+        crypto,
         ttl_seconds,
         created_at,
         updated_at,
@@ -2291,6 +2716,7 @@ export class DeviceSession {
         ${item.status},
         ${JSON.stringify(envelope.visible_metadata ?? {})}::jsonb,
         ${envelope.ciphertext},
+        ${JSON.stringify(envelope.crypto ?? {})}::jsonb,
         ${envelope.ttl_seconds ?? 300},
         ${envelope.created_at ?? new Date().toISOString()},
         ${new Date().toISOString()},
@@ -2302,11 +2728,58 @@ export class DeviceSession {
         status = excluded.status,
         visible_metadata = excluded.visible_metadata,
         ciphertext = excluded.ciphertext,
+        crypto = excluded.crypto,
         ttl_seconds = excluded.ttl_seconds,
         updated_at = excluded.updated_at,
         expires_at = excluded.expires_at,
         error_code = excluded.error_code,
         error_message = excluded.error_message
+    `;
+  }
+
+  private async persistMessageStatusEvent(item: StoredMessage, status: MessageState) {
+    const sql = this.neon();
+    if (!sql) return;
+
+    const envelope = item.envelope;
+    const ordinal = String(item.history.length).padStart(3, "0");
+    const event: MessageStatusEventRecord = {
+      id: `${envelope.message_id}_status_${ordinal}_${status}`,
+      message_id: envelope.message_id,
+      workspace_id: envelope.workspace_id,
+      status,
+      stage: status,
+      metadata: {},
+      created_at: new Date().toISOString(),
+    };
+    await sql`
+      insert into message_status_events (
+        id,
+        message_id,
+        workspace_id,
+        status,
+        stage,
+        error_code,
+        error_message,
+        metadata,
+        created_at
+      ) values (
+        ${event.id},
+        ${event.message_id},
+        ${event.workspace_id},
+        ${event.status},
+        ${event.stage ?? null},
+        ${event.error_code ?? null},
+        ${event.error_message ?? null},
+        ${JSON.stringify(event.metadata)}::jsonb,
+        ${event.created_at}
+      )
+      on conflict (id) do update set
+        status = excluded.status,
+        stage = excluded.stage,
+        error_code = excluded.error_code,
+        error_message = excluded.error_message,
+        metadata = excluded.metadata
     `;
   }
 
@@ -3044,6 +3517,69 @@ function groupBy<T>(items: T[], keyFor: (item: T) => string | undefined): Map<st
     grouped.set(value, group);
   }
   return grouped;
+}
+
+function queryLimit(url: URL, fallback: number, max: number): number {
+  const raw = Number(url.searchParams.get("limit") ?? fallback);
+  if (!Number.isFinite(raw) || raw <= 0) return fallback;
+  return Math.min(Math.floor(raw), max);
+}
+
+function keysetCursor(url: URL, field = "created_at"): Record<string, string | null> {
+  const decoded = decodeCursor(url.searchParams.get("cursor"));
+  const value = typeof decoded?.[field] === "string" ? decoded[field] as string : null;
+  const id = typeof decoded?.id === "string" ? decoded.id as string : null;
+  return { [field]: value, id };
+}
+
+function nextKeysetCursor<T extends Record<string, any>>(page: T[], rowCount: number, limit: number, field = "created_at"): string | null {
+  if (rowCount <= limit || page.length === 0) return null;
+  const last = page[page.length - 1];
+  return encodeCursor({ [field]: last[field], id: last.id });
+}
+
+function paginateList<T>(items: T[], url: URL, keyFor: (item: T) => string, fallbackLimit = 100) {
+  const limit = queryLimit(url, fallbackLimit, 500);
+  const cursor = decodeCursor(url.searchParams.get("cursor"));
+  const start = typeof cursor?.offset === "number" && cursor.offset > 0 ? Math.floor(cursor.offset) : 0;
+  const page = items.slice(start, start + limit);
+  const next_cursor = start + limit < items.length ? encodeCursor({ offset: start + limit, key: page.length ? keyFor(page[page.length - 1]) : "" }) : null;
+  return { page, next_cursor, limit };
+}
+
+function encodeCursor(value: Record<string, unknown>): string {
+  return btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function decodeCursor(value: string | null): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+    const decoded = JSON.parse(atob(padded));
+    return decoded && typeof decoded === "object" ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function messageCryptoView(row: any) {
+  let crypto = typeof row.crypto === "string" ? undefined : row.crypto;
+  if (typeof row.crypto === "string") {
+    try {
+      crypto = JSON.parse(row.crypto || "{}");
+    } catch {
+      crypto = {};
+    }
+  }
+  crypto ??= {};
+  const ciphertext = typeof row.ciphertext === "string" ? row.ciphertext : "";
+  return {
+    version: crypto.version ?? "unknown",
+    alg: crypto.alg ?? "unknown",
+    sender_key_id: crypto.sender_key_id ?? "",
+    recipient_key_id: crypto.recipient_key_id ?? "",
+    payload_size: crypto.payload_size ?? ciphertext.length,
+  };
 }
 
 function base64ToBytes(input: string): Uint8Array {

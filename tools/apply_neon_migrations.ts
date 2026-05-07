@@ -13,6 +13,7 @@ const migrationPaths = [
   "migrations/004_device_plugin_capabilities.sql",
   "migrations/005_control_plane_m2.sql",
   "migrations/006_third_party_app_platform_m4.sql",
+  "migrations/007_hosted_query_indexes.sql",
 ];
 
 const sql = neon(databaseUrl);

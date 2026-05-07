@@ -1,7 +1,8 @@
 const state = {
   route: location.hash.replace("#", "") || "home",
-  data: {},
+  data: emptyData(),
   createdApiKey: null,
+  pagination: {},
   messageFilters: { app_id: "", device_id: "", status: "", channel: "" },
   auditFilters: { event_type: "", app_id: "", device_id: "" },
 };
@@ -10,10 +11,25 @@ const title = document.querySelector("#page-title");
 const copy = document.querySelector("#page-copy");
 const root = document.querySelector("#app");
 const refresh = document.querySelector("#refresh");
+const PAGINATED_ROUTE_KEYS = [
+  "devices",
+  "apps",
+  "apps.devices",
+  "apps.capabilities",
+  "developerApps",
+  "authorizedApps",
+  "plugins",
+  "messages",
+  "audit",
+  "home.messages",
+  "home.audit",
+];
 
 refresh.addEventListener("click", () => load());
 window.addEventListener("hashchange", () => {
-  state.route = location.hash.replace("#", "") || "home";
+  const nextRoute = location.hash.replace("#", "") || "home";
+  if (state.route !== nextRoute) resetAllPagination();
+  state.route = nextRoute;
   load();
 });
 
@@ -23,21 +39,99 @@ async function load() {
   markActive();
   root.innerHTML = `<div class="panel loading-state">Loading...</div>`;
   try {
-    const [devices, apps, messages, audit, capabilities, authorizedApps, plugins, pluginPolicy] = await Promise.all([
-      api("/v1/devices"),
-      api("/v1/apps"),
-      api("/v1/messages"),
-      api("/v1/audit-events"),
-      api("/v1/device-plugin-capabilities"),
-      api("/v1/authorized-apps"),
-      api("/v1/plugins"),
-      api("/v1/workspace/plugin-policy"),
-    ]);
-    state.data = { devices, apps, messages, audit, capabilities, authorizedApps, plugins, pluginPolicy };
-    render();
+    state.data = { ...emptyData(), ...(await loadRouteData()) };
+    await render();
+    bindPaginationControls();
   } catch (error) {
     root.innerHTML = `<div class="panel error-state">Control plane data failed to load: ${escapeHtml(error.message)}</div>`;
   }
+}
+
+async function loadRouteData() {
+  const [name, id] = state.route.split("/");
+  if (state.route === "apps/new" || name === "settings") return {};
+  if (state.route === "apps/authorized") return { authorizedApps: await pagedApi("/v1/authorized-apps", "authorizedApps") };
+  if (name === "consent" && id) return { consentDetail: await api(`/v1/consent-requests/${id}`) };
+  if (name === "plugins" && id) return { pluginDetail: await api(`/v1/plugins/${id}`) };
+  if (name === "devices" && id) return { deviceDetail: await api(`/v1/devices/${id}`) };
+  if (name === "apps" && id) return { appDetail: await api(`/v1/apps/${id}`) };
+  if (name === "messages" && id) return { messageDetail: await api(`/v1/messages/${id}`) };
+  if (name === "devices") return { devices: await pagedApi("/v1/devices", "devices") };
+  if (name === "apps") {
+    const [apps, devices, capabilities] = await Promise.all([
+      pagedApi("/v1/apps", "apps"),
+      pagedApi("/v1/devices", "apps.devices"),
+      pagedApi("/v1/device-plugin-capabilities", "apps.capabilities"),
+    ]);
+    return { apps, devices, capabilities };
+  }
+  if (name === "developer") return { apps: await pagedApi("/v1/apps", "developerApps") };
+  if (name === "plugins") {
+    const [plugins, pluginPolicy] = await Promise.all([
+      pagedApi("/v1/plugins", "plugins"),
+      api("/v1/workspace/plugin-policy"),
+    ]);
+    return { plugins, pluginPolicy };
+  }
+  if (name === "messages") return { messages: await pagedApi("/v1/messages", "messages", activeFilterParams(state.messageFilters)) };
+  if (name === "audit") return { audit: await pagedApi("/v1/audit-events", "audit", activeFilterParams(state.auditFilters)) };
+
+  const [devices, apps, messages, audit] = await Promise.all([
+    api("/v1/devices"),
+    api("/v1/apps"),
+    pagedApi("/v1/messages", "home.messages"),
+    pagedApi("/v1/audit-events", "home.audit"),
+  ]);
+  return { devices, apps, messages, audit };
+}
+
+function pagedApi(path, key, extraParams = {}) {
+  const page = paginationFor(key);
+  const params = new URLSearchParams({ limit: String(page.limit) });
+  if (page.cursor) params.set("cursor", page.cursor);
+  for (const [name, value] of Object.entries(extraParams)) {
+    if (value) params.set(name, value);
+  }
+  return api(`${path}?${params.toString()}`);
+}
+
+function paginationFor(key) {
+  state.pagination[key] ??= { limit: 100, cursor: null, history: [] };
+  return state.pagination[key];
+}
+
+function resetAllPagination() {
+  for (const key of PAGINATED_ROUTE_KEYS) {
+    resetPagination(key);
+  }
+}
+
+function resetPagination(key) {
+  const page = paginationFor(key);
+  page.cursor = null;
+  page.history = [];
+}
+
+function activeFilterParams(filters) {
+  return Object.fromEntries(Object.entries(filters).filter(([, value]) => value));
+}
+
+function emptyData() {
+  return {
+    devices: { devices: [] },
+    apps: { apps: [] },
+    messages: { messages: [] },
+    audit: { audit_events: [] },
+    capabilities: { capabilities: [] },
+    authorizedApps: { authorized_apps: [], apps: [] },
+    plugins: { plugins: [] },
+    pluginPolicy: { policy: defaultPluginPolicy() },
+    consentDetail: null,
+    pluginDetail: null,
+    deviceDetail: null,
+    appDetail: null,
+    messageDetail: null,
+  };
 }
 
 async function api(path, options) {
@@ -50,7 +144,7 @@ async function api(path, options) {
   return json;
 }
 
-function render() {
+async function render() {
   const [name, id] = state.route.split("/");
   if (state.route === "apps/new") return renderNewApp();
   if (state.route === "apps/authorized") return renderAuthorizedApps();
@@ -122,13 +216,13 @@ function renderDevices() {
       ${metric("Plugins", sum(devices, "plugin_count"), "Reported capabilities")}
       ${metric("Grants", sum(devices, "authorized_app_count"), "Authorized app links")}
     </section>
-    ${panel("Devices", deviceTable(devices), "table-panel")}
+    ${panel("Devices", `${deviceTable(devices)}${paginationControls("devices", state.data.devices)}`, "table-panel")}
   `;
 }
 
-async function renderDevice(id) {
+function renderDevice(id) {
   setHeader("Device Detail", "Inspect capabilities, authorized apps, local policy context, messages, and audit.");
-  const detail = await api(`/v1/devices/${id}`);
+  const detail = state.data.deviceDetail;
   root.innerHTML = `
     <section class="detail-layout">
       <div class="detail-main">
@@ -176,6 +270,7 @@ function renderApps() {
         ${panel("Apps", `
           <div class="panel-tools"><button class="primary" onclick="location.hash='apps/new'">New user-owned app</button></div>
           ${appTable(state.data.apps.apps)}
+          ${paginationControls("apps", state.data.apps)}
         `, "table-panel")}
       </div>
       <aside class="detail-rail">
@@ -244,7 +339,7 @@ curl -X POST ${server}/v1/developer/apps/app_001/permission-declarations -H 'Con
           <pre>${escapeHtml(snippet)}</pre>
           <button data-copy="${escapeHtml(snippet)}">Copy developer flow</button>
         `)}
-        ${panel("Registered Apps", appTable(state.data.apps.apps), "table-panel")}
+        ${panel("Registered Apps", `${appTable(state.data.apps.apps)}${paginationControls("developerApps", state.data.apps)}`, "table-panel")}
       </div>
       <aside class="detail-rail">
         ${panel("Consent Request", `
@@ -261,9 +356,9 @@ curl -X POST ${server}/v1/developer/apps/app_001/permission-declarations -H 'Con
   bindCopy();
 }
 
-async function renderConsent(id) {
+function renderConsent(id) {
   setHeader("Consent", "Review app identity, publisher, requested permissions, and local device scope.");
-  const detail = await api(`/v1/consent-requests/${id}`);
+  const detail = state.data.consentDetail;
   const app = detail.app;
   const request = detail.consent_request;
   const devices = detail.devices || [];
@@ -331,7 +426,7 @@ function renderAuthorizedApps() {
   const rows = state.data.authorizedApps.authorized_apps || [];
   root.innerHTML = `
     <section class="notice">Authorized app grants can be revoked without deleting message or audit history.</section>
-    ${panel("Third-party Apps", authorizedAppTable(rows), "table-panel")}
+    ${panel("Third-party Apps", `${authorizedAppTable(rows)}${paginationControls("authorizedApps", state.data.authorizedApps)}`, "table-panel")}
   `;
   bindActions();
 }
@@ -347,7 +442,7 @@ function renderPlugins() {
       ${metric("Allowed trust", policy.allowed_trust_levels.join(", "), "Workspace policy")}
       ${metric("Blocked plugins", policy.blocked_plugins.length, "Explicit denials")}
     </section>
-    ${panel("Registry", pluginTable(plugins), "table-panel")}
+    ${panel("Registry", `${pluginTable(plugins)}${paginationControls("plugins", state.data.plugins)}`, "table-panel")}
   `;
 }
 
@@ -359,9 +454,9 @@ function defaultPluginPolicy() {
   };
 }
 
-async function renderPlugin(name) {
+function renderPlugin(name) {
   setHeader("Plugin Detail", "Inspect manifest, publisher trust, signature metadata, and install command.");
-  const detail = await api(`/v1/plugins/${name}`);
+  const detail = state.data.pluginDetail;
   const plugin = detail.plugin;
   const installCommand = `go run ./cmd/musubi plugin install ${plugin.name} --server ${location.origin} --home .musubi/m4 --version ${plugin.version} --yes`;
   root.innerHTML = `
@@ -394,9 +489,9 @@ async function renderPlugin(name) {
   bindCopy();
 }
 
-async function renderApp(id) {
+function renderApp(id) {
   setHeader("App Detail", "Inspect app identity, keys, authorized devices, messages, and safety actions.");
-  const detail = await api(`/v1/apps/${id}`);
+  const detail = state.data.appDetail;
   root.innerHTML = `
     <section class="detail-layout">
       <div class="detail-main">
@@ -457,20 +552,21 @@ async function renderApp(id) {
 
 function renderMessages() {
   setHeader("Messages", "Message lifecycle across apps and devices. Payload plaintext is not displayed.");
-  const messages = filterRows(state.data.messages.messages, state.messageFilters);
+  const messages = state.data.messages.messages;
   root.innerHTML = `
     <section class="notice">Payload encrypted end-to-end. Musubi server cannot display task contents.</section>
     ${panel("Messages", `
       ${messageFilters()}
       ${messageTable(messages)}
+      ${paginationControls("messages", state.data.messages)}
     `, "table-panel")}
   `;
   bindFilters();
 }
 
-async function renderMessage(id) {
+function renderMessage(id) {
   setHeader("Message Detail", "Timeline, routing metadata, crypto metadata, and safe error details.");
-  const detail = await api(`/v1/messages/${id}`);
+  const detail = state.data.messageDetail;
   root.innerHTML = `
     <section class="detail-layout">
       <div class="detail-main">
@@ -511,12 +607,13 @@ async function renderMessage(id) {
 
 function renderAudit() {
   setHeader("Audit", "Security-relevant events across the workspace.");
-  const auditEvents = filterRows(state.data.audit.audit_events, state.auditFilters);
+  const auditEvents = state.data.audit.audit_events;
   root.innerHTML = `
     <section class="notice">Audit events exclude decrypted payloads.</section>
     ${panel("Audit Events", `
       ${auditFilters()}
       ${auditTable(auditEvents)}
+      ${paginationControls("audit", state.data.audit)}
     `, "table-panel")}
   `;
   bindFilters();
@@ -734,11 +831,12 @@ function auditFilters() {
 }
 
 function selectFilter(id, field, label, values, selected) {
+  const options = unique([selected, ...values].filter(Boolean));
   return `
     <label>${label}
       <select id="${id}" data-filter-field="${field}">
         <option value="">All</option>
-        ${values.map((value) => `<option value="${escapeHtml(value)}" ${selected === value ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+        ${options.map((value) => `<option value="${escapeHtml(value)}" ${selected === value ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
       </select>
     </label>
   `;
@@ -748,8 +846,56 @@ function bindFilters() {
   document.querySelectorAll("[data-filter-field]").forEach((select) => {
     select.addEventListener("change", () => {
       const target = select.id.startsWith("audit-") ? state.auditFilters : state.messageFilters;
+      const pageKey = select.id.startsWith("audit-") ? "audit" : "messages";
       target[select.dataset.filterField] = select.value;
-      render();
+      resetPagination(pageKey);
+      load();
+    });
+  });
+}
+
+function paginationControls(key, response) {
+  const page = paginationFor(key);
+  const hasPrevious = page.history.length > 0;
+  const hasNext = Boolean(response?.next_cursor);
+  return `
+    <div class="pagination-bar" data-pagination-key="${escapeHtml(key)}">
+      <button data-page-prev="${escapeHtml(key)}" ${hasPrevious ? "" : "disabled"}>Previous</button>
+      <label>Rows
+        <select data-page-limit="${escapeHtml(key)}">
+          ${[25, 50, 100, 200].map((limit) => `<option value="${limit}" ${page.limit === limit ? "selected" : ""}>${limit}</option>`).join("")}
+        </select>
+      </label>
+      <button data-page-next="${escapeHtml(key)}" data-next-cursor="${escapeHtml(response?.next_cursor || "")}" ${hasNext ? "" : "disabled"}>Next</button>
+    </div>
+  `;
+}
+
+function bindPaginationControls() {
+  document.querySelectorAll("[data-page-prev]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const page = paginationFor(button.dataset.pagePrev);
+      page.cursor = page.history.pop() || null;
+      load();
+    });
+  });
+  document.querySelectorAll("[data-page-next]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const next = button.dataset.nextCursor;
+      if (!next) return;
+      const page = paginationFor(button.dataset.pageNext);
+      page.history.push(page.cursor);
+      page.cursor = next;
+      load();
+    });
+  });
+  document.querySelectorAll("[data-page-limit]").forEach((select) => {
+    select.addEventListener("change", () => {
+      const page = paginationFor(select.dataset.pageLimit);
+      page.limit = Number(select.value);
+      page.cursor = null;
+      page.history = [];
+      load();
     });
   });
 }
@@ -790,17 +936,27 @@ function grantForm() {
   const devices = state.data.devices.devices.filter((device) => device.status !== "revoked");
   const capabilities = state.data.capabilities.capabilities;
   const canCreateGrant = apps.length && devices.length && capabilities.length;
+  const pluginOptions = [...new Set(capabilities.map((capability) => capability.plugin_name))];
+  const missingGrantInputs = [];
+  if (!apps.length) missingGrantInputs.push("active apps");
+  if (!devices.length) missingGrantInputs.push("online devices");
+  if (!pluginOptions.length) missingGrantInputs.push("reported plugin capabilities");
+  const grantPageWarning = missingGrantInputs.length
+    ? `No grant input is available on the currently loaded page (${missingGrantInputs.join(", ")}).`
+      + " Use the page controls or increase page size to load more rows."
+    : "";
   return `
     <div class="form-grid grant-form">
       <label>App<select id="grant-app">${apps.map((app) => `<option value="${app.id}">${escapeHtml(app.name)} (${app.type})</option>`).join("")}</select></label>
       <label>Device<select id="grant-device">${devices.map((device) => `<option value="${device.id}">${escapeHtml(device.name)} (${device.status})</option>`).join("")}</select></label>
-      <label>Plugin<select id="grant-plugin">${[...new Set(capabilities.map((capability) => capability.plugin_name))].map((name) => `<option value="${name}">${escapeHtml(name)}</option>`).join("")}</select></label>
+      <label>Plugin<select id="grant-plugin">${pluginOptions.map((name) => `<option value="${name}">${escapeHtml(name)}</option>`).join("")}</select></label>
       <div class="channel-editor">
         <h3>Channels</h3>
         <div id="grant-channels" class="checkboxes"></div>
       </div>
       <label class="toggle-line"><input id="grant-queueing" type="checkbox" /> Queueing enabled</label>
       <p class="notice inline">If queueing is disabled, requests fail when the device is offline. This avoids old tasks running unexpectedly when a device reconnects.</p>
+      ${grantPageWarning ? `<p class="notice inline">${escapeHtml(grantPageWarning)}</p>` : ""}
       <p class="muted" id="grant-review"></p>
       <button class="primary" id="create-grant" ${canCreateGrant ? "" : "disabled"}>Create grant</button>
     </div>
