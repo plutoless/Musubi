@@ -215,6 +215,26 @@ interface AppAbuseReportRecord {
   resolved_at?: string;
 }
 
+interface WorkspacePluginPolicyRecord {
+  require_signature: boolean;
+  allowed_trust_levels: string[];
+  allowed_plugins: string[];
+  blocked_plugins: string[];
+  require_approval_for_permission_increase: boolean;
+  updated_at?: string;
+}
+
+interface RegistryPluginVersion {
+  version: string;
+  manifest: Record<string, unknown>;
+  package_url: string;
+  package_digest: string;
+  signed_payload: string;
+  signature: string;
+  signing_key_id: string;
+  signature_status?: "verified" | "invalid" | "unsigned";
+}
+
 interface AppAuth {
   app: AppRecord;
   apiKey: AppApiKeyRecord;
@@ -340,6 +360,34 @@ export class DeviceSession {
 
     if (url.pathname === "/v1/authorized-apps" && request.method === "GET") {
       return this.handleListAuthorizedApps();
+    }
+
+    if (url.pathname === "/v1/plugins" && request.method === "GET") {
+      return Response.json({ plugins: HOSTED_PLUGIN_NAMES.map((name) => registryPluginResponse(name)?.plugin).filter(Boolean) });
+    }
+
+    const pluginVersionMatch = url.pathname.match(/^\/v1\/plugins\/([^/]+)\/versions\/([^/]+)$/);
+    if (pluginVersionMatch && request.method === "GET") {
+      const plugin = registryPluginResponse(pluginVersionMatch[1], pluginVersionMatch[2]);
+      return plugin ? Response.json(plugin) : Response.json({ error: "not found" }, { status: 404 });
+    }
+
+    const pluginMatch = url.pathname.match(/^\/v1\/plugins\/([^/]+)$/);
+    if (pluginMatch && request.method === "GET") {
+      const plugin = registryPluginResponse(pluginMatch[1]);
+      return plugin ? Response.json(plugin) : Response.json({ error: "not found" }, { status: 404 });
+    }
+
+    if (url.pathname === "/v1/plugin-registry/resolve" && request.method === "GET") {
+      return this.handleResolvePlugin(url);
+    }
+
+    if (url.pathname === "/v1/workspace/plugin-policy" && request.method === "GET") {
+      return Response.json({ policy: await this.workspacePluginPolicy() });
+    }
+
+    if (url.pathname === "/v1/workspace/plugin-policy" && request.method === "PATCH") {
+      return this.handleUpdateWorkspacePluginPolicy(request);
     }
 
     const appReportMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/report$/);
@@ -1327,6 +1375,41 @@ export class DeviceSession {
       });
     }
     return Response.json({ authorized_apps: rows, apps: rows });
+  }
+
+  private async handleResolvePlugin(url: URL): Promise<Response> {
+    const requestedName = url.searchParams.get("name") ?? "";
+    const requestedVersion = url.searchParams.get("version") ?? "latest";
+    const plugin = registryPluginResponse(requestedName, requestedVersion);
+    if (!plugin) return Response.json({ error: "not found" }, { status: 404 });
+    await this.audit("user", "user_local", requestedVersion === "latest" ? "plugin.update_checked" : "plugin.registry_resolved", {
+      workspace_id: "ws_local",
+      metadata: { plugin_name: requestedName, requested_version: requestedVersion, resolved_version: plugin.plugin.version },
+    });
+    return Response.json(plugin);
+  }
+
+  private async workspacePluginPolicy(): Promise<WorkspacePluginPolicyRecord> {
+    return await this.state.storage.get<WorkspacePluginPolicyRecord>("workspace_plugin_policy") ?? defaultWorkspacePluginPolicy();
+  }
+
+  private async handleUpdateWorkspacePluginPolicy(request: Request): Promise<Response> {
+    const body = await request.json().catch(() => ({})) as Partial<WorkspacePluginPolicyRecord>;
+    const policy = await this.workspacePluginPolicy();
+    if (body.require_signature !== undefined) policy.require_signature = body.require_signature;
+    if (body.allowed_trust_levels) policy.allowed_trust_levels = body.allowed_trust_levels;
+    if (body.allowed_plugins) policy.allowed_plugins = body.allowed_plugins;
+    if (body.blocked_plugins) policy.blocked_plugins = body.blocked_plugins;
+    if (body.require_approval_for_permission_increase !== undefined) {
+      policy.require_approval_for_permission_increase = body.require_approval_for_permission_increase;
+    }
+    policy.updated_at = new Date().toISOString();
+    await this.state.storage.put("workspace_plugin_policy", policy);
+    await this.audit("user", "user_local", "workspace.plugin_policy_updated", {
+      workspace_id: "ws_local",
+      metadata: { policy },
+    });
+    return Response.json({ policy });
   }
 
   private async handleReportApp(request: Request, appId: string): Promise<Response> {
@@ -2766,6 +2849,168 @@ export class DeviceSession {
     map[id] = value;
     await this.state.storage.put(name, map);
   }
+}
+
+const HOSTED_PLUGIN_NAMES = ["echo", "hermes", "codex", "community-signed", "community-unsigned"];
+const HOSTED_PLUGIN_SIGNING_KEY_ID = "pluginkey_musubi_hosted";
+const HOSTED_PLUGIN_SIGNING_PUBLIC_KEY = "MCowBQYDK2VwAyEADF5vh2Howbqtkfpc73jOz9EgrXsiV7cCx9VVhVKuuks=";
+const HOSTED_PLUGIN_LATEST_BY_NAME: Record<string, string> = {
+  echo: "0.1.0",
+  hermes: "0.1.0",
+  codex: "0.3.0",
+  "community-signed": "1.0.0",
+  "community-unsigned": "1.0.0",
+};
+const HOSTED_PLUGIN_REGISTRY: Record<string, {
+  version: string;
+  trust: string;
+  channels: string[];
+  permissions: string[];
+  package_digest: string;
+  signed_payload: string;
+  signature: string;
+  signature_status: "verified" | "invalid" | "unsigned";
+}> = {
+  "codex@0.2.5": {
+    version: "0.2.5",
+    trust: "official",
+    channels: ["codex.task.create", "codex.task.cancel", "codex.task.status"],
+    permissions: ["process.spawn", "fs.read.project", "fs.write.project", "network.outbound"],
+    package_digest: "sha256:f45a11b2380474b6a546d09fe3d1a3a14e5ec14184600d1cf5ae7ac0a5403aee",
+    signed_payload: "codex|0.2.5|5ade71883bff64709b8e86c9db0408190df42d9816a5beb9fcd5d1a983b2f2d5",
+    signature: "i+5/zri1IJ8NxrjPaKcZ3qgTjcBEtD8yMv6x75iSNpvKV3BQhdK6i855i00xivPo7/cAoBUShhk88j9mRoTWCA==",
+    signature_status: "verified",
+  },
+  "codex@0.3.0": {
+    version: "0.3.0",
+    trust: "official",
+    channels: ["codex.task.create", "codex.task.cancel", "codex.task.status"],
+    permissions: ["process.spawn", "fs.read.project", "fs.write.project", "network.outbound", "fs.write.any"],
+    package_digest: "sha256:114700cdc1cead4023cd7390e9dc5e1b81cf6b23e27dc89f232d40c30eaa54a0",
+    signed_payload: "codex|0.3.0|d6c6ce7a5922ecbfcfc9c870045fef543ff000f2d5b67f602713d73e79ed0c28",
+    signature: "EZi34q/gUmqhN8a3DerHO+l1vSTIYVMpjO/DxQVPuhRalD0rfpgxKT79HYjvy0qMq7n4MJHAdH3Tppwy+XUPDw==",
+    signature_status: "verified",
+  },
+  "codex@tampered": {
+    version: "tampered",
+    trust: "official",
+    channels: ["codex.task.create"],
+    permissions: ["process.spawn"],
+    package_digest: "sha256:19bcb761acd18593b64bd27b0d3a00fbb0ecfae2c634cd2bb80b0b9d72aad81b",
+    signed_payload: "codex|tampered|80f8c9d4dc67f79e5a4129f47a80ede81d6172849fcd65a2d264e9d3f0231f7c",
+    signature: "xkdr47+dsa0BkHt4stX/V8tD9djSY5vnLtn/apO7KBodShuLcNw0Y0/7Kqp5yBWMp2p4sCixDXSmsvaslslaDQxx",
+    signature_status: "invalid",
+  },
+  "echo@0.1.0": {
+    version: "0.1.0",
+    trust: "official",
+    channels: ["echo.echo", "echo.ping"],
+    permissions: ["status.report"],
+    package_digest: "sha256:91a5f6eda390ea588e9a831d44af522ca088168622aaa0243c74cc45541049cf",
+    signed_payload: "echo|0.1.0|434af7c4b02316f48bac7a94e4f3e075bf38749df80f5f8a326f0c778cbf33c1",
+    signature: "Tz8gDIUfmknIbjfFuHspQksSsKlx8VLKfZodo2x9IrQnE9lSgdMcA2be4H+Ol5UOOvd3Y2pKrLR30gnv7poJAQ==",
+    signature_status: "verified",
+  },
+  "hermes@0.1.0": {
+    version: "0.1.0",
+    trust: "official",
+    channels: ["hermes.task.create", "hermes.task.cancel", "hermes.task.status"],
+    permissions: ["process.spawn", "fs.read.project", "fs.write.project", "network.outbound"],
+    package_digest: "sha256:07ce6a3f2e540092c9eee6254f7cefcfdb718bcd14e38436b4d4e9a45e824d97",
+    signed_payload: "hermes|0.1.0|564398536c9c474907ca0bc204cb8db9db04ba78a2c9583be892a9456679ed99",
+    signature: "LbFgZEVyTcna1bdN3bTwIIubIC6SCl0vYrw8PGnGYMGrOvt4Bb8X5RcvlpV1GyeIPJHOe/6iMlNlBBjOAQ/qCg==",
+    signature_status: "verified",
+  },
+  "community-signed@1.0.0": {
+    version: "1.0.0",
+    trust: "community",
+    channels: ["community.run"],
+    permissions: ["process.spawn"],
+    package_digest: "sha256:4486bc69be1b8672e2d3cca51f5c3ac7532a04899c349c90b34120ec1c264e63",
+    signed_payload: "community-signed|1.0.0|a1fd19dd525ff1826dbca9f6da7de0472095ada1f0cc4cf63916af3d8598535f",
+    signature: "MoIUViA5UNLYsMIl0FrkIv3lTNxuPFlJo3Buxj7DHBiAOg/9BqTBkS66+8cje2fOJKig/rmi06LAUSK2r1RXCg==",
+    signature_status: "verified",
+  },
+  "community-unsigned@1.0.0": {
+    version: "1.0.0",
+    trust: "community",
+    channels: ["community.run"],
+    permissions: ["process.spawn.any"],
+    package_digest: "sha256:d804719b90b2f2e6310e088bb5d4f4d9de7b99e359e030e5e8972aacd101558c",
+    signed_payload: "community-unsigned|1.0.0|18bbe856307aae9659e1a26c3cec2c04fa8d682d4368bd990e9a1c79c88d7da8",
+    signature: "",
+    signature_status: "unsigned",
+  },
+};
+
+function defaultWorkspacePluginPolicy(): WorkspacePluginPolicyRecord {
+  return {
+    require_signature: true,
+    allowed_trust_levels: ["official", "verified"],
+    allowed_plugins: ["echo", "hermes", "codex"],
+    blocked_plugins: [],
+    require_approval_for_permission_increase: true,
+  };
+}
+
+function registryPluginResponse(name: string, version = "latest") {
+  const resolved = registryVersion(name, version);
+  if (!resolved) return undefined;
+  const manifest = resolved.manifest as { publisher?: unknown };
+  return {
+    plugin: {
+      name,
+      version: resolved.version,
+      publisher: manifest.publisher,
+      manifest: resolved.manifest,
+      package_url: resolved.package_url,
+      package_digest: resolved.package_digest,
+      signed_payload: resolved.signed_payload,
+      signature: resolved.signature,
+      signing_key_id: resolved.signing_key_id,
+      signing_public_key: HOSTED_PLUGIN_SIGNING_PUBLIC_KEY,
+      signature_status: resolved.signature_status,
+    },
+  };
+}
+
+function registryVersion(name: string, version = "latest"): RegistryPluginVersion | undefined {
+  const resolved = version === "latest" ? HOSTED_PLUGIN_LATEST_BY_NAME[name] : version;
+  const seed = HOSTED_PLUGIN_REGISTRY[`${name}@${resolved}`];
+  if (!seed) return undefined;
+  return {
+    version: seed.version,
+    manifest: pluginManifestV2(name, seed.version, seed.trust, seed.channels, seed.permissions),
+    package_url: `registry://plugins/${name}/${seed.version}`,
+    package_digest: seed.package_digest,
+    signed_payload: seed.signed_payload,
+    signature: seed.signature,
+    signing_key_id: HOSTED_PLUGIN_SIGNING_KEY_ID,
+    signature_status: seed.signature_status,
+  };
+}
+
+function pluginManifestV2(name: string, version: string, trust: string, channels: string[], permissions: string[]) {
+  return {
+    name,
+    version,
+    publisher: {
+      id: trust === "official" ? "plugpub_musubi" : "plugpub_community",
+      name: trust === "official" ? "Musubi" : "Community",
+      trust,
+    },
+    description: `${name} plugin package`,
+    runtime: "bun",
+    entry: `bun run plugins/${name}/src/main.ts`,
+    channels,
+    event_channels: channels.some((channel) => channel.includes("codex"))
+      ? ["codex.task.event"]
+      : channels.some((channel) => channel.includes("hermes"))
+        ? ["hermes.task.event"]
+        : [],
+    permissions,
+    config_schema: {},
+  };
 }
 
 function jsonRequest(url: string, body: unknown): Request {

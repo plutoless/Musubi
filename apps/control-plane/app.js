@@ -339,7 +339,7 @@ function renderAuthorizedApps() {
 function renderPlugins() {
   setHeader("Plugins", "Registry packages, signatures, trust level, and workspace install policy.");
   const plugins = state.data.plugins.plugins || [];
-  const policy = state.data.pluginPolicy.policy;
+  const policy = state.data.pluginPolicy.policy || defaultPluginPolicy();
   root.innerHTML = `
     <section class="metric-strip compact">
       ${metric("Registry plugins", plugins.length, "Available locally")}
@@ -349,6 +349,14 @@ function renderPlugins() {
     </section>
     ${panel("Registry", pluginTable(plugins), "table-panel")}
   `;
+}
+
+function defaultPluginPolicy() {
+  return {
+    require_signature: true,
+    allowed_trust_levels: ["official", "verified"],
+    blocked_plugins: [],
+  };
 }
 
 async function renderPlugin(name) {
