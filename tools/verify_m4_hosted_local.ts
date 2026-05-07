@@ -1,3 +1,4 @@
+import { rm, writeFile } from "node:fs/promises";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { neon } from "@neondatabase/serverless";
 import { MusubiApp, createNativeAuthorization, exchangeNativeAuthorizationCode, generateX25519KeyPair, hermesPayload } from "../sdk/app-js/src/index.ts";
@@ -20,11 +21,13 @@ let port = randomPort();
 let serverUrl = `http://127.0.0.1:${port}`;
 const workspaceId = `ws_m4_hosted_local_${Date.now()}`;
 const sql = databaseUrl ? neon(databaseUrl) : undefined;
+const workerEnvFile = `${process.cwd()}/.cache/m4-hosted-local.env`;
 let adminCookie = "";
 
 if (import.meta.main) {
   requireHostedLocalNeon("verify:m4-hosted-local");
   await run("bun", ["run", "db:migrate:neon"]);
+  await writeFile(workerEnvFile, `NEON_DATABASE_URL=${databaseUrl}\n`);
 
   let worker = startWorker();
   try {
@@ -58,6 +61,7 @@ if (import.meta.main) {
     await expectDenied(() => resumedClient.devices.listGranted(), "suspended app auth did not remain denied after Worker restart");
   } finally {
     await stopWorker(worker);
+    await rm(workerEnvFile, { force: true });
   }
 
   console.log("[m4-hosted-local] ok: hosted M4 trust APIs use Neon-backed state across Worker restart");
@@ -65,7 +69,7 @@ if (import.meta.main) {
 }
 
 function startWorker(): ChildProcessWithoutNullStreams {
-  const child = spawn("bunx", ["wrangler", "dev", "--ip", "127.0.0.1", "--port", port, "--var", `NEON_DATABASE_URL:${databaseUrl}`], {
+  const child = spawn("bunx", ["wrangler", "dev", "--ip", "127.0.0.1", "--port", port, "--env-file", workerEnvFile], {
     cwd: `${process.cwd()}/server/workers`,
     env: {
       ...process.env,
