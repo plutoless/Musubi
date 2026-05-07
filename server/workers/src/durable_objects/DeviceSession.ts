@@ -1232,12 +1232,65 @@ export class DeviceSession {
       order by created_at desc
       limit 100
     ` as AppRecord[];
+    const appIds = apps.map((app) => app.id);
+    if (appIds.length === 0) return Response.json({ authorized_apps: [], apps: [] });
+
+    const publisherIds = [...new Set(apps.map((app) => app.publisher_id).filter(Boolean))] as string[];
+    const [publishers, declarations, grants, reports] = await Promise.all([
+      publisherIds.length
+        ? sql`select * from publisher_profiles where id = any(${publisherIds}::text[])` as Promise<PublisherRecord[]>
+        : Promise.resolve([]),
+      sql`
+        select *
+        from app_permission_declarations
+        where app_id = any(${appIds}::text[])
+        order by created_at asc
+      ` as Promise<PermissionDeclarationRecord[]>,
+      sql`
+        select *
+        from app_device_channel_grants
+        where app_id = any(${appIds}::text[])
+        order by created_at desc
+      ` as Promise<GrantRecord[]>,
+      sql`
+        select *
+        from app_abuse_reports
+        where app_id = any(${appIds}::text[])
+        order by created_at desc
+      ` as Promise<AppAbuseReportRecord[]>,
+    ]);
+
+    const deviceIds = [...new Set(grants.map((grant) => grant.device_id).filter(Boolean))] as string[];
+    const devices = deviceIds.length
+      ? await sql`select * from devices where id = any(${deviceIds}::text[])` as DeviceRecord[]
+      : [];
+
+    const publishersById = new Map(publishers.map((publisher) => [publisher.id, publisher]));
+    const devicesById = new Map(devices.map((device) => [device.id, device]));
+    const declarationsByAppId = groupBy(declarations, (declaration) => declaration.app_id);
+    const grantsByAppId = groupBy(grants, (grant) => grant.app_id);
+    const reportsByAppId = groupBy(reports, (report) => report.app_id);
+
     const rows = [];
     for (const app of apps) {
+      const appGrants = grantsByAppId.get(app.id) ?? [];
+      const activeGrants = appGrants.filter((grant) => !grant.revoked_at);
+      const appView = {
+        ...app,
+        publisher: app.publisher_id ? publishersById.get(app.publisher_id) : undefined,
+        permission_declarations: declarationsByAppId.get(app.id) ?? [],
+        authorized_device_count: new Set(activeGrants.map((grant) => grant.device_id)).size,
+        allowed_channel_count: new Set(activeGrants.flatMap((grant) => grant.allowed_channels ?? [])).size,
+      };
       rows.push({
-        app: await this.hostedAppView(app),
-        grants: await Promise.all((await this.hostedAppGrants(app.id)).map((grant) => this.grantView(grant))),
-        reports: await this.hostedAppReports(app.id),
+        app: appView,
+        grants: appGrants.map((grant) => ({
+          ...grant,
+          status: grant.revoked_at ? "revoked" : "active",
+          app,
+          device: devicesById.get(grant.device_id),
+        })),
+        reports: reportsByAppId.get(app.id) ?? [],
       });
     }
     return Response.json({ authorized_apps: rows, apps: rows });
@@ -2701,6 +2754,18 @@ function websocketOrigin(url: string): string {
 
 function isTerminalMessageState(status: MessageState) {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "expired";
+}
+
+function groupBy<T>(items: T[], keyFor: (item: T) => string | undefined): Map<string, T[]> {
+  const grouped = new Map<string, T[]>();
+  for (const item of items) {
+    const value = keyFor(item);
+    if (!value) continue;
+    const group = grouped.get(value) ?? [];
+    group.push(item);
+    grouped.set(value, group);
+  }
+  return grouped;
 }
 
 function base64ToBytes(input: string): Uint8Array {
