@@ -42,6 +42,7 @@ interface StoredMessage {
   envelope: MessageEnvelope;
   status: MessageState;
   history: MessageState[];
+  result_events?: ResultEnvelope[];
   result?: ResultEnvelope;
 }
 
@@ -52,9 +53,12 @@ interface DeviceRecord {
   name: string;
   platform: string;
   cli_version: string;
-  status: "offline" | "online";
+  status: "offline" | "online" | "revoked";
   created_at: string;
   last_seen_at?: string;
+  last_capability_report_at?: string;
+  revoked_at?: string;
+  revoked_by?: string;
 }
 
 interface DeviceKeyRecord {
@@ -70,9 +74,21 @@ interface AppRecord {
   id: string;
   workspace_id: string;
   name: string;
-  type: "first_party" | "user_owned";
-  status: "active" | "revoked";
+  description?: string;
+  type: "first_party" | "user_owned" | "third_party";
+  status: "draft" | "active" | "disabled" | "revoked" | "suspended";
+  publisher_id?: string;
+  website?: string;
+  privacy_policy_url?: string;
+  terms_url?: string;
+  trust_status?: "unverified" | "verified" | "official" | "suspicious" | "blocked";
+  review_status?: "not_submitted" | "in_review" | "approved" | "rejected" | "changes_requested";
   created_at: string;
+  updated_at?: string;
+  disabled_at?: string;
+  disabled_by?: string;
+  revoked_at?: string;
+  revoked_by?: string;
 }
 
 interface AppKeyRecord {
@@ -88,10 +104,15 @@ interface GrantRecord {
   workspace_id: string;
   app_id: string;
   device_id: string;
+  name?: string;
+  description?: string;
   allowed_channels: string[];
   queueing_allowed: boolean;
+  created_from_consent_request_id?: string;
   created_at: string;
+  updated_at?: string;
   revoked_at?: string;
+  revoked_by?: string;
 }
 
 interface AuditEventRecord {
@@ -118,6 +139,85 @@ interface DevicePluginCapabilityRecord {
   permissions: string[];
   manifest: Record<string, unknown>;
   reported_at: string;
+}
+
+interface AppApiKeyRecord {
+  id: string;
+  app_id: string;
+  name: string;
+  prefix: string;
+  key_hash: string;
+  status: "active" | "revoked";
+  created_at: string;
+  last_used_at?: string;
+  revoked_at?: string;
+  revoked_by?: string;
+}
+
+interface DeveloperRecord {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  email?: string;
+  status: "active" | "suspended";
+  created_at: string;
+  verified_at?: string;
+  suspended_at?: string;
+}
+
+interface PublisherRecord {
+  id: string;
+  developer_id: string;
+  display_name: string;
+  website?: string;
+  support_email?: string;
+  privacy_policy_url?: string;
+  terms_url?: string;
+  logo_url?: string;
+  verification_status: "unverified" | "verified" | "suspended";
+  created_at: string;
+  updated_at?: string;
+}
+
+interface PermissionDeclarationRecord {
+  id: string;
+  app_id: string;
+  plugin_name: string;
+  channels: string[];
+  reason?: string;
+  queueing_requested: boolean;
+  created_at: string;
+  updated_at?: string;
+}
+
+interface ConsentRequestRecord {
+  id: string;
+  app_id: string;
+  user_id?: string;
+  state?: string;
+  redirect_uri?: string;
+  requested_capabilities: Array<{ plugin: string; channels: string[]; reason?: string }>;
+  status: "pending" | "approved" | "cancelled" | "expired";
+  created_at: string;
+  completed_at?: string;
+  expires_at?: string;
+  grant_id?: string;
+}
+
+interface AppAbuseReportRecord {
+  id: string;
+  app_id: string;
+  reporter_user_id?: string;
+  reason: string;
+  description?: string;
+  status: "open" | "resolved";
+  created_at: string;
+  resolved_at?: string;
+}
+
+interface AppAuth {
+  app: AppRecord;
+  apiKey: AppApiKeyRecord;
 }
 
 export class DeviceSession {
@@ -149,8 +249,79 @@ export class DeviceSession {
       return this.handleCreateApp(request);
     }
 
+    if (url.pathname === "/v1/apps" && request.method === "GET") {
+      return this.handleListApps(url);
+    }
+
+    if (url.pathname === "/v1/devices" && request.method === "GET") {
+      return this.handleListDevices(url);
+    }
+
+    if (url.pathname === "/v1/developers" && request.method === "POST") {
+      return this.handleCreateDeveloper(request);
+    }
+
+    if (url.pathname === "/v1/developers" && request.method === "GET") {
+      return this.handleListDevelopers();
+    }
+
+    const developerMatch = url.pathname.match(/^\/v1\/developers\/([^/]+)$/);
+    if (developerMatch && request.method === "PATCH") {
+      return this.handleUpdateDeveloper(request, developerMatch[1]);
+    }
+
+    if (url.pathname === "/v1/publishers" && request.method === "POST") {
+      return this.handleCreatePublisher(request);
+    }
+
+    if (url.pathname === "/v1/publishers" && request.method === "GET") {
+      return this.handleListPublishers();
+    }
+
+    const publisherMatch = url.pathname.match(/^\/v1\/publishers\/([^/]+)$/);
+    if (publisherMatch && request.method === "PATCH") {
+      return this.handleUpdatePublisher(request, publisherMatch[1]);
+    }
+
+    if (url.pathname === "/v1/developer/apps" && request.method === "POST") {
+      return this.handleCreateDeveloperApp(request);
+    }
+
+    const developerApiKeyMatch = url.pathname.match(/^\/v1\/developer\/apps\/([^/]+)\/api-keys$/);
+    if (developerApiKeyMatch && request.method === "POST") {
+      return this.handleCreateAppApiKey(request, developerApiKeyMatch[1]);
+    }
+
+    const declarationMatch = url.pathname.match(/^\/v1\/developer\/apps\/([^/]+)\/permission-declarations$/);
+    if (declarationMatch && request.method === "POST") {
+      return this.handleCreatePermissionDeclaration(request, declarationMatch[1]);
+    }
+
+    if (url.pathname === "/v1/consent-requests" && request.method === "POST") {
+      return this.handleCreateConsentRequest(request);
+    }
+
+    const consentMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)$/);
+    if (consentMatch && request.method === "GET") {
+      return this.handleGetConsentRequest(consentMatch[1]);
+    }
+
+    const consentApproveMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)\/approve$/);
+    if (consentApproveMatch && request.method === "POST") {
+      return this.handleApproveConsent(request, consentApproveMatch[1]);
+    }
+
+    const consentDenyMatch = url.pathname.match(/^\/v1\/consent-requests\/([^/]+)\/deny$/);
+    if (consentDenyMatch && request.method === "POST") {
+      return this.handleDenyConsent(request, consentDenyMatch[1]);
+    }
+
     if (url.pathname === "/v1/grants" && request.method === "POST") {
       return this.handleCreateGrant(request);
+    }
+
+    if (url.pathname === "/v1/grants" && request.method === "GET") {
+      return this.handleListGrants(url);
     }
 
     if (url.pathname === "/v1/permissions/check" && request.method === "POST") {
@@ -167,6 +338,33 @@ export class DeviceSession {
       return this.handleRevokeGrant(grantRevokeMatch[1]);
     }
 
+    if (url.pathname === "/v1/authorized-apps" && request.method === "GET") {
+      return this.handleListAuthorizedApps();
+    }
+
+    const appReportMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/report$/);
+    if (appReportMatch && request.method === "POST") {
+      return this.handleReportApp(request, appReportMatch[1]);
+    }
+
+    const appSuspendMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/suspend$/);
+    if (appSuspendMatch && request.method === "POST") {
+      return this.handleSuspendApp(appSuspendMatch[1]);
+    }
+
+    const appRevokeMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/revoke$/);
+    if (appRevokeMatch && request.method === "POST") {
+      return this.handleRevokeApp(appRevokeMatch[1]);
+    }
+
+    const apiKeyMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)\/api-keys$/);
+    if (apiKeyMatch && request.method === "POST") {
+      return this.handleCreateAppApiKey(request, apiKeyMatch[1]);
+    }
+    if (apiKeyMatch && request.method === "GET") {
+      return this.handleListAppApiKeys(apiKeyMatch[1]);
+    }
+
     const appMatch = url.pathname.match(/^\/v1\/apps\/([^/]+)$/);
     if (appMatch && request.method === "GET") {
       return this.handleGetApp(appMatch[1]);
@@ -181,6 +379,10 @@ export class DeviceSession {
       return this.handleCreateMessage(request);
     }
 
+    if (url.pathname === "/v1/messages" && request.method === "GET") {
+      return this.handleListMessages(url);
+    }
+
     const cancelMatch = url.pathname.match(/^\/v1\/messages\/([^/]+)\/cancel$/);
     if (cancelMatch && request.method === "POST") {
       return this.handleCancelMessage(cancelMatch[1]);
@@ -191,11 +393,35 @@ export class DeviceSession {
       return this.handleGetMessage(messageMatch[1]);
     }
 
+    const messageEventsMatch = url.pathname.match(/^\/v1\/messages\/([^/]+)\/events$/);
+    if (messageEventsMatch && request.method === "GET") {
+      return this.handleGetMessageEvents(messageEventsMatch[1], url);
+    }
+
+    if (url.pathname === "/v1/app/devices" && request.method === "GET") {
+      return this.handleListGrantedAppDevices(request);
+    }
+
+    const appDeviceKeyMatch = url.pathname.match(/^\/v1\/app\/devices\/([^/]+)\/public-key$/);
+    if (appDeviceKeyMatch && request.method === "GET") {
+      return this.handleGetAppDevicePublicKey(request, appDeviceKeyMatch[1]);
+    }
+
     if (url.pathname === "/v1/audit-events" && request.method === "GET") {
       return this.handleGetAuditEvents(url.searchParams.get("message_id"));
     }
 
     if (url.pathname === "/v1/device-plugin-capabilities" && request.method === "GET") {
+      const sql = this.neon();
+      if (sql) {
+        const capabilities = await sql`
+          select *
+          from device_plugin_capabilities
+          order by reported_at desc
+          limit 200
+        ` as DevicePluginCapabilityRecord[];
+        return Response.json({ capabilities });
+      }
       return Response.json({ capabilities: await this.list<DevicePluginCapabilityRecord>("device_plugin_capabilities") });
     }
 
@@ -220,10 +446,11 @@ export class DeviceSession {
       public_key: string;
       auth_public_key?: string;
     };
+    const sql = this.neon();
     const devices = await this.list<DeviceRecord>("devices");
     const suffix = String(devices.length + 1).padStart(3, "0");
-    const deviceId = `dev_${suffix}`;
-    const keyId = `devkey_${suffix}`;
+    const deviceId = sql ? generatedId("dev") : `dev_${suffix}`;
+    const keyId = sql ? generatedId("devkey") : `devkey_${suffix}`;
     const now = new Date().toISOString();
     const device: DeviceRecord = {
       id: deviceId,
@@ -266,13 +493,14 @@ export class DeviceSession {
     const body = await request.json() as {
       workspace_id: string;
       name: string;
-      type?: "first_party" | "user_owned";
+      type?: "first_party" | "user_owned" | "third_party";
       public_key: string;
     };
+    const sql = this.neon();
     const apps = await this.list<AppRecord>("apps");
     const suffix = String(apps.length + 1).padStart(3, "0");
-    const appId = `app_${suffix}`;
-    const keyId = `appkey_${suffix}`;
+    const appId = sql ? generatedId("app") : `app_${suffix}`;
+    const keyId = sql ? generatedId("appkey") : `appkey_${suffix}`;
     const now = new Date().toISOString();
     const app: AppRecord = {
       id: appId,
@@ -302,6 +530,544 @@ export class DeviceSession {
     return Response.json({ app_id: appId, app_key_id: keyId, status: app.status });
   }
 
+  private async handleListApps(url: URL): Promise<Response> {
+    const sql = this.neon();
+    if (!sql) {
+      const apps = await this.list<AppRecord>("apps");
+      return Response.json({ apps });
+    }
+    let rows = await sql`
+      select
+        apps.*,
+        publisher_profiles.display_name as publisher_display_name,
+        publisher_profiles.verification_status as publisher_verification_status
+      from apps
+      left join publisher_profiles on publisher_profiles.id = apps.publisher_id
+      order by apps.created_at desc
+      limit 100
+    ` as any[];
+    const type = url.searchParams.get("type");
+    if (type) rows = rows.filter((row) => row.type === type);
+    const apps = await Promise.all(rows.map(async (row) => this.hostedAppView(row)));
+    return Response.json({ apps, next_cursor: null });
+  }
+
+  private async handleListDevices(url: URL): Promise<Response> {
+    const sql = this.neon();
+    if (!sql) {
+      const devices = await this.list<DeviceRecord>("devices");
+      return Response.json({ devices, next_cursor: null });
+    }
+    let rows = await sql`
+      select *
+      from devices
+      order by created_at desc
+      limit 100
+    ` as any[];
+    const workspaceId = url.searchParams.get("workspace_id");
+    const status = url.searchParams.get("status");
+    if (workspaceId) rows = rows.filter((row) => row.workspace_id === workspaceId);
+    if (status) rows = rows.filter((row) => row.status === status);
+    return Response.json({
+      devices: rows.map((device) => ({
+        id: device.id,
+        name: device.display_name ?? device.name,
+        status: device.status,
+        platform: device.platform,
+        cli_version: device.cli_version,
+        plugin_count: 0,
+        authorized_app_count: 0,
+        last_seen_at: device.last_seen_at,
+        last_capability_report_at: device.last_capability_report_at,
+        created_at: device.created_at,
+      })),
+      next_cursor: null,
+    });
+  }
+
+  private async handleCreateDeveloper(request: Request): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as { name?: string; email?: string };
+    await this.persistWorkspace("ws_local");
+    await this.persistUser({ id: "user_local", name: "Local User" });
+    const developer: DeveloperRecord = {
+      id: generatedId("devacct"),
+      owner_user_id: "user_local",
+      name: body.name || "Local Developer",
+      email: body.email,
+      status: "active",
+      created_at: new Date().toISOString(),
+    };
+    await sql`
+      insert into developer_accounts (id, owner_user_id, name, email, status, created_at)
+      values (${developer.id}, ${developer.owner_user_id}, ${developer.name}, ${developer.email ?? null}, ${developer.status}, ${developer.created_at})
+    `;
+    await this.audit("user", "user_local", "developer.created", {
+      workspace_id: "ws_local",
+      metadata: { developer_id: developer.id },
+    });
+    return Response.json({ developer });
+  }
+
+  private async handleListDevelopers(): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const developers = await sql`
+      select *
+      from developer_accounts
+      order by created_at desc
+      limit 100
+    ` as DeveloperRecord[];
+    return Response.json({ developers });
+  }
+
+  private async handleUpdateDeveloper(request: Request, developerId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const existing = (await sql`select * from developer_accounts where id = ${developerId} limit 1` as DeveloperRecord[])[0];
+    if (!existing) return Response.json({ error: "not found" }, { status: 404 });
+    const body = await request.json().catch(() => ({})) as Partial<DeveloperRecord>;
+    const developer: DeveloperRecord = {
+      ...existing,
+      name: body.name ?? existing.name,
+      email: body.email !== undefined ? body.email : existing.email,
+      status: body.status === "active" || body.status === "suspended" ? body.status : existing.status,
+      suspended_at: body.status === "suspended" ? new Date().toISOString() : existing.suspended_at,
+    };
+    await sql`
+      update developer_accounts
+      set name = ${developer.name},
+          email = ${developer.email ?? null},
+          status = ${developer.status},
+          suspended_at = ${developer.suspended_at ?? null}
+      where id = ${developer.id}
+    `;
+    await this.persistWorkspace("ws_local");
+    await this.audit("user", "user_local", developer.status === "suspended" ? "developer.suspended" : "developer.updated", {
+      workspace_id: "ws_local",
+      metadata: { developer_id: developer.id },
+    });
+    return Response.json({ developer });
+  }
+
+  private async handleCreatePublisher(request: Request): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as {
+      developer_id?: string;
+      display_name?: string;
+      website?: string;
+      support_email?: string;
+      privacy_policy_url?: string;
+      terms_url?: string;
+    };
+    if (!body.developer_id) return Response.json({ error: "developer_id required" }, { status: 400 });
+    const developer = (await sql`select id from developer_accounts where id = ${body.developer_id} limit 1` as any[])[0];
+    if (!developer) return Response.json({ error: "developer denied" }, { status: 400 });
+    await this.persistWorkspace("ws_local");
+    const publisher: PublisherRecord = {
+      id: generatedId("pub"),
+      developer_id: body.developer_id,
+      display_name: body.display_name || "Unverified Publisher",
+      website: body.website,
+      support_email: body.support_email,
+      privacy_policy_url: body.privacy_policy_url,
+      terms_url: body.terms_url,
+      verification_status: "unverified",
+      created_at: new Date().toISOString(),
+    };
+    await sql`
+      insert into publisher_profiles (
+        id, developer_id, display_name, website, support_email, privacy_policy_url, terms_url, verification_status, created_at
+      ) values (
+        ${publisher.id}, ${publisher.developer_id}, ${publisher.display_name}, ${publisher.website ?? null},
+        ${publisher.support_email ?? null}, ${publisher.privacy_policy_url ?? null}, ${publisher.terms_url ?? null},
+        ${publisher.verification_status}, ${publisher.created_at}
+      )
+    `;
+    await this.audit("user", "user_local", "publisher.created", {
+      workspace_id: "ws_local",
+      metadata: { publisher_id: publisher.id },
+    });
+    return Response.json({ publisher });
+  }
+
+  private async handleListPublishers(): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const publishers = await sql`
+      select *
+      from publisher_profiles
+      order by created_at desc
+      limit 100
+    ` as PublisherRecord[];
+    return Response.json({ publishers });
+  }
+
+  private async handleUpdatePublisher(request: Request, publisherId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const existing = (await sql`select * from publisher_profiles where id = ${publisherId} limit 1` as PublisherRecord[])[0];
+    if (!existing) return Response.json({ error: "not found" }, { status: 404 });
+    const body = await request.json().catch(() => ({})) as Partial<PublisherRecord>;
+    const publisher: PublisherRecord = {
+      ...existing,
+      display_name: body.display_name ?? existing.display_name,
+      website: body.website !== undefined ? body.website : existing.website,
+      support_email: body.support_email !== undefined ? body.support_email : existing.support_email,
+      privacy_policy_url: body.privacy_policy_url !== undefined ? body.privacy_policy_url : existing.privacy_policy_url,
+      terms_url: body.terms_url !== undefined ? body.terms_url : existing.terms_url,
+      logo_url: body.logo_url !== undefined ? body.logo_url : existing.logo_url,
+      verification_status: body.verification_status === "unverified" || body.verification_status === "verified" || body.verification_status === "suspended" ? body.verification_status : existing.verification_status,
+      updated_at: new Date().toISOString(),
+    };
+    await sql`
+      update publisher_profiles
+      set display_name = ${publisher.display_name},
+          website = ${publisher.website ?? null},
+          support_email = ${publisher.support_email ?? null},
+          privacy_policy_url = ${publisher.privacy_policy_url ?? null},
+          terms_url = ${publisher.terms_url ?? null},
+          logo_url = ${publisher.logo_url ?? null},
+          verification_status = ${publisher.verification_status},
+          updated_at = ${publisher.updated_at}
+      where id = ${publisher.id}
+    `;
+    await this.persistWorkspace("ws_local");
+    const eventType = publisher.verification_status === "verified"
+      ? "publisher.verified"
+      : publisher.verification_status === "suspended"
+        ? "publisher.suspended"
+        : "publisher.updated";
+    await this.audit("user", "user_local", eventType, {
+      workspace_id: "ws_local",
+      metadata: { publisher_id: publisher.id },
+    });
+    return Response.json({ publisher });
+  }
+
+  private async handleCreateDeveloperApp(request: Request): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as {
+      workspace_id?: string;
+      name?: string;
+      public_key?: string;
+      publisher_id?: string;
+      description?: string;
+      website?: string;
+      privacy_policy_url?: string;
+      terms_url?: string;
+    };
+    if (!body.name || !body.public_key || !body.publisher_id) {
+      return Response.json({ error: "name, public_key, and publisher_id required" }, { status: 400 });
+    }
+    const publisher = (await sql`select * from publisher_profiles where id = ${body.publisher_id} limit 1` as PublisherRecord[])[0];
+    if (!publisher) return Response.json({ error: "publisher denied" }, { status: 400 });
+    const app: AppRecord = {
+      id: generatedId("app"),
+      workspace_id: body.workspace_id ?? "ws_local",
+      name: body.name,
+      description: body.description,
+      type: "third_party",
+      status: "active",
+      publisher_id: body.publisher_id,
+      website: body.website,
+      privacy_policy_url: body.privacy_policy_url,
+      terms_url: body.terms_url,
+      trust_status: "unverified",
+      review_status: "approved",
+      created_at: new Date().toISOString(),
+    };
+    const key: AppKeyRecord = {
+      id: generatedId("appkey"),
+      app_id: app.id,
+      public_key: body.public_key,
+      status: "active",
+      created_at: app.created_at,
+    };
+    await this.persistWorkspace(app.workspace_id);
+    await this.putMapItem("apps", app.id, app);
+    await this.putMapItem("app_keys", key.id, key);
+    await this.persistApp(app);
+    await this.persistAppKey(key);
+    await this.audit("user", "user_local", "app.created", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_key_id: key.id, type: app.type },
+    });
+    await this.audit("developer", publisher.id, "third_party_app.created", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_key_id: key.id, publisher_id: publisher.id },
+    });
+    const apiKeyResponse = await this.createAppApiKey(app, "Developer backend key");
+    return Response.json({
+      app_id: app.id,
+      app_key_id: key.id,
+      status: app.status,
+      trust_status: app.trust_status,
+      api_key: apiKeyResponse.secret,
+      api_key_record: this.appApiKeyView(apiKeyResponse.key),
+    });
+  }
+
+  private async handleCreateAppApiKey(request: Request, appId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const app = await this.hostedApp(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    if (app.status !== "active") return Response.json({ error: "app revoked" }, { status: 409 });
+    const body = await request.json().catch(() => ({})) as { name?: string };
+    const created = await this.createAppApiKey(app, body.name || "Default API key");
+    return Response.json({ api_key: created.secret, key: this.appApiKeyView(created.key) });
+  }
+
+  private async handleListAppApiKeys(appId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const app = await this.hostedApp(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const keys = await sql`
+      select id, app_id, name, prefix, status, created_at, last_used_at, revoked_at, revoked_by
+      from app_api_keys
+      where app_id = ${appId}
+      order by created_at asc
+    ` as AppApiKeyRecord[];
+    return Response.json({ api_keys: keys });
+  }
+
+  private async handleCreatePermissionDeclaration(request: Request, appId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const app = await this.hostedApp(appId);
+    if (!app || app.type !== "third_party") return Response.json({ error: "third-party app not found" }, { status: 404 });
+    const body = await request.json().catch(() => ({})) as { plugin_name?: string; channels?: string[]; reason?: string; queueing_requested?: boolean };
+    if (!body.plugin_name || !body.channels?.length) return Response.json({ error: "plugin_name and channels required" }, { status: 400 });
+    const declaration: PermissionDeclarationRecord = {
+      id: generatedId("apd"),
+      app_id: appId,
+      plugin_name: body.plugin_name,
+      channels: body.channels,
+      reason: body.reason,
+      queueing_requested: body.queueing_requested ?? false,
+      created_at: new Date().toISOString(),
+    };
+    await sql`
+      insert into app_permission_declarations (
+        id, app_id, plugin_name, channels, reason, queueing_requested, created_at
+      ) values (
+        ${declaration.id}, ${declaration.app_id}, ${declaration.plugin_name}, ${declaration.channels},
+        ${declaration.reason ?? null}, ${declaration.queueing_requested}, ${declaration.created_at}
+      )
+    `;
+    await this.audit("developer", appId, "app.permission_declared", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { declaration_id: declaration.id, plugin_name: declaration.plugin_name, channels: declaration.channels },
+    });
+    await this.audit("developer", appId, "permission_declaration.created", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { declaration_id: declaration.id, plugin_name: declaration.plugin_name, channels: declaration.channels },
+    });
+    return Response.json({ declaration });
+  }
+
+  private async handleCreateConsentRequest(request: Request): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const body = await request.json().catch(() => ({})) as {
+      app_id?: string;
+      state?: string;
+      redirect_uri?: string;
+      requested_capabilities?: Array<{ plugin: string; channels: string[]; reason?: string }>;
+    };
+    const app = body.app_id ? await this.hostedApp(body.app_id) : undefined;
+    if (!app || app.type !== "third_party" || app.status !== "active") return Response.json({ error: "third-party app denied" }, { status: 400 });
+    if (app.trust_status === "blocked") return Response.json({ error: "app blocked" }, { status: 403 });
+    const publisher = app.publisher_id ? await this.hostedPublisher(app.publisher_id) : undefined;
+    if (publisher?.verification_status === "suspended") return Response.json({ error: "publisher suspended" }, { status: 403 });
+    const declarations = await this.hostedPermissionDeclarations(app.id);
+    const declared = declarations.map((item) => ({ plugin: item.plugin_name, channels: item.channels, reason: item.reason }));
+    const requested = body.requested_capabilities?.length ? body.requested_capabilities : declared;
+    const declaredChannels = new Set(declared.flatMap((item) => item.channels));
+    const undeclared = requested.flatMap((item) => item.channels).filter((channel) => !declaredChannels.has(channel));
+    if (undeclared.length) return Response.json({ error: `undeclared channels: ${undeclared.join(", ")}` }, { status: 400 });
+    const consent: ConsentRequestRecord = {
+      id: generatedId("consent"),
+      app_id: app.id,
+      user_id: "user_local",
+      state: body.state,
+      redirect_uri: body.redirect_uri,
+      requested_capabilities: requested,
+      status: "pending",
+      created_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    };
+    await this.persistUser({ id: "user_local", name: "Local User" });
+    await sql`
+      insert into consent_requests (
+        id, app_id, user_id, state, redirect_uri, requested_capabilities, status, created_at, expires_at
+      ) values (
+        ${consent.id}, ${consent.app_id}, ${consent.user_id ?? null}, ${consent.state ?? null},
+        ${consent.redirect_uri ?? null}, ${JSON.stringify(consent.requested_capabilities)}::jsonb,
+        ${consent.status}, ${consent.created_at}, ${consent.expires_at ?? null}
+      )
+    `;
+    await this.audit("app", app.id, "consent.requested", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { consent_id: consent.id },
+    });
+    await this.audit("app", app.id, "consent_request.created", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { consent_id: consent.id },
+    });
+    return Response.json({
+      consent_request: consent,
+      consent_request_id: consent.id,
+      consent_url: `/control-plane#consent/${consent.id}`,
+      status: consent.status,
+      expires_at: consent.expires_at,
+    });
+  }
+
+  private async handleGetConsentRequest(consentId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const consent = await this.hostedConsent(consentId);
+    if (!consent) return Response.json({ error: "not found" }, { status: 404 });
+    const app = await this.hostedApp(consent.app_id);
+    const publisher = app?.publisher_id ? await this.hostedPublisher(app.publisher_id) : undefined;
+    const declarations = app ? await this.hostedPermissionDeclarations(app.id) : [];
+    const devices = await sql`
+      select *
+      from devices
+      where revoked_at is null
+      order by created_at asc
+      limit 100
+    ` as DeviceRecord[];
+    const capabilities = await sql`
+      select *
+      from device_plugin_capabilities
+      order by reported_at desc
+      limit 200
+    ` as DevicePluginCapabilityRecord[];
+    return Response.json({
+      consent_request: consent,
+      app: app ? await this.hostedAppView(app) : undefined,
+      publisher,
+      permission_declarations: declarations,
+      devices,
+      eligible_devices: devices,
+      capabilities,
+    });
+  }
+
+  private async handleApproveConsent(request: Request, consentId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const consent = await this.hostedConsent(consentId);
+    if (!consent || consent.status !== "pending") return Response.json({ error: "consent not pending" }, { status: 404 });
+    const app = await this.hostedApp(consent.app_id);
+    if (!app) return Response.json({ error: "app not found" }, { status: 404 });
+    const body = await request.json().catch(() => ({})) as { device_id?: string; allowed_channels?: string[]; queueing_allowed?: boolean };
+    const channels = body.allowed_channels ?? [];
+    if (!body.device_id || channels.length === 0) return Response.json({ error: "device_id and allowed_channels required" }, { status: 400 });
+    const declarations = await this.hostedPermissionDeclarations(app.id);
+    const declared = new Set(declarations.flatMap((item) => item.channels));
+    const undeclared = channels.filter((channel) => !declared.has(channel));
+    if (undeclared.length) return Response.json({ error: `undeclared channels: ${undeclared.join(", ")}` }, { status: 400 });
+    const denied = await this.checkGrantPreconditions(app.workspace_id, app.id, body.device_id);
+    if (denied) return Response.json({ status: "failed", error: denied }, { status: 400 });
+
+    const now = new Date().toISOString();
+    const grant: GrantRecord = {
+      id: generatedId("grant"),
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      device_id: body.device_id,
+      name: "Third-party consent grant",
+      allowed_channels: channels,
+      queueing_allowed: body.queueing_allowed ?? false,
+      created_from_consent_request_id: consent.id,
+      created_at: now,
+      updated_at: now,
+    };
+    const approvedConsent = { ...consent, status: "approved" as const, completed_at: now, grant_id: grant.id };
+    const auditEvents = [
+      this.auditEvent("user", "user_local", "grant.created", {
+        workspace_id: grant.workspace_id,
+        app_id: grant.app_id,
+        device_id: grant.device_id,
+        metadata: { grant_id: grant.id, allowed_channels: grant.allowed_channels },
+      }),
+      this.auditEvent("user", "user_local", "consent.approved", {
+        workspace_id: app.workspace_id,
+        app_id: app.id,
+        device_id: grant.device_id,
+        metadata: { consent_id: consent.id, grant_id: grant.id, channels },
+      }),
+      this.auditEvent("user", "user_local", "consent_request.approved", {
+        workspace_id: app.workspace_id,
+        app_id: app.id,
+        device_id: grant.device_id,
+        metadata: { consent_id: consent.id, grant_id: grant.id, channels },
+      }),
+    ];
+    await sql.transaction([
+      this.persistGrantQuery(sql, grant),
+      sql`
+        update consent_requests
+        set status = 'approved',
+            completed_at = ${now},
+            grant_id = ${grant.id}
+        where id = ${consent.id}
+      `,
+      ...auditEvents.map((event) => this.persistAuditEventQuery(sql, event)),
+    ]);
+    await this.putMapItem("grants", grant.id, grant);
+    for (const event of auditEvents) await this.putMapItem("audit_events", event.id, event);
+    return Response.json({
+      status: "approved",
+      grant_id: grant.id,
+      redirect_uri: consent.redirect_uri ? callbackUrl(consent.redirect_uri, consent.state, "approved", grant.id) : undefined,
+      consent_request: approvedConsent,
+      grant: await this.grantView(grant),
+    });
+  }
+
+  private async handleDenyConsent(request: Request, consentId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const consent = await this.hostedConsent(consentId);
+    if (!consent || consent.status !== "pending") return Response.json({ error: "consent not pending" }, { status: 404 });
+    const app = await this.hostedApp(consent.app_id);
+    if (!app) return Response.json({ error: "app not found" }, { status: 404 });
+    const body = await request.json().catch(() => ({})) as { reason?: string };
+    const now = new Date().toISOString();
+    const cancelled = { ...consent, status: "cancelled" as const, completed_at: now };
+    await sql`
+      update consent_requests
+      set status = 'cancelled',
+          completed_at = ${now}
+      where id = ${consent.id}
+    `;
+    await this.audit("user", "user_local", "consent_request.denied", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { consent_id: consent.id, reason: body.reason || "user_denied" },
+    });
+    return Response.json({
+      status: "denied",
+      redirect_uri: consent.redirect_uri ? callbackUrl(consent.redirect_uri, consent.state, "denied") : undefined,
+      consent_request: cancelled,
+    });
+  }
+
   private async handleCreateGrant(request: Request): Promise<Response> {
     const body = await request.json() as {
       workspace_id: string;
@@ -309,21 +1075,29 @@ export class DeviceSession {
       device_id: string;
       allowed_channels: string[];
       queueing_allowed?: boolean;
+      name?: string;
+      description?: string;
+      created_from_consent_request_id?: string;
     };
     const denied = await this.checkGrantPreconditions(body.workspace_id, body.app_id, body.device_id);
     if (denied) return Response.json({ status: "failed", error: denied }, { status: 400 });
 
+    const sql = this.neon();
     const grants = await this.list<GrantRecord>("grants");
     const suffix = String(grants.length + 1).padStart(3, "0");
-    const grantId = `grant_${suffix}`;
+    const grantId = sql ? generatedId("grant") : `grant_${suffix}`;
     const grant: GrantRecord = {
       id: grantId,
       workspace_id: body.workspace_id,
       app_id: body.app_id,
       device_id: body.device_id,
+      name: body.name,
+      description: body.description,
       allowed_channels: body.allowed_channels,
       queueing_allowed: body.queueing_allowed ?? false,
+      created_from_consent_request_id: body.created_from_consent_request_id,
       created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     };
     await this.putMapItem("grants", grantId, grant);
     await this.persistGrant(grant);
@@ -333,7 +1107,31 @@ export class DeviceSession {
       device_id: body.device_id,
       metadata: { grant_id: grantId, allowed_channels: body.allowed_channels },
     });
-    return Response.json({ grant_id: grantId, status: "active" });
+    return Response.json({ grant_id: grantId, status: "active", grant: await this.grantView(grant) });
+  }
+
+  private async handleListGrants(url: URL): Promise<Response> {
+    const sql = this.neon();
+    if (!sql) {
+      let grants = await this.list<GrantRecord>("grants");
+      for (const field of ["app_id", "device_id", "workspace_id"] as const) {
+        const value = url.searchParams.get(field);
+        if (value) grants = grants.filter((grant) => grant[field] === value);
+      }
+      return Response.json({ grants, next_cursor: null });
+    }
+    let rows = await sql`
+      select *
+      from app_device_channel_grants
+      order by created_at desc
+      limit 100
+    ` as GrantRecord[];
+    for (const field of ["app_id", "device_id", "workspace_id"] as const) {
+      const value = url.searchParams.get(field);
+      if (value) rows = rows.filter((grant) => grant[field] === value);
+    }
+    const grants = await Promise.all(rows.map((grant) => this.grantView(grant)));
+    return Response.json({ grants, next_cursor: null });
   }
 
   private async handlePermissionCheck(request: Request): Promise<Response> {
@@ -348,8 +1146,10 @@ export class DeviceSession {
   }
 
   private async handleReportCapabilities(request: Request, deviceId: string): Promise<Response> {
-    const device = await this.getMapItem<DeviceRecord>("devices", deviceId);
+    const sql = this.neon();
+    const device = sql ? await this.hostedDevice(deviceId) : await this.getMapItem<DeviceRecord>("devices", deviceId);
     if (!device) return Response.json({ error: "not found" }, { status: 404 });
+    if (device.status === "revoked" || device.revoked_at) return Response.json({ error: "device revoked" }, { status: 403 });
     const body = await request.json() as {
       plugins: Array<{
         name: string;
@@ -359,10 +1159,13 @@ export class DeviceSession {
         manifest?: Record<string, unknown>;
       }>;
     };
-    const existing = await this.list<DevicePluginCapabilityRecord>("device_plugin_capabilities");
+    const existing = sql ? [] : await this.list<DevicePluginCapabilityRecord>("device_plugin_capabilities");
     const now = new Date().toISOString();
+    device.last_capability_report_at = now;
+    await this.putMapItem("devices", deviceId, device);
+    await this.persistDevice(device);
     for (const [index, plugin] of (body.plugins ?? []).entries()) {
-      const id = `cap_${String(existing.length + index + 1).padStart(6, "0")}_${plugin.name}`;
+      const id = sql ? generatedId("cap") : `cap_${String(existing.length + index + 1).padStart(6, "0")}_${plugin.name}`;
       await this.putMapItem("device_plugin_capabilities", id, {
         id,
         workspace_id: device.workspace_id,
@@ -402,9 +1205,12 @@ export class DeviceSession {
   }
 
   private async handleRevokeGrant(grantId: string): Promise<Response> {
-    const grant = await this.getMapItem<GrantRecord>("grants", grantId);
+    const sql = this.neon();
+    const grant = sql ? await this.hostedGrant(grantId) : await this.getMapItem<GrantRecord>("grants", grantId);
     if (!grant) return Response.json({ error: "not found" }, { status: 404 });
     grant.revoked_at = new Date().toISOString();
+    grant.revoked_by = "user_local";
+    grant.updated_at = grant.revoked_at;
     await this.putMapItem("grants", grantId, grant);
     await this.persistGrant(grant);
     await this.audit("user", "user_local", "grant.revoked", {
@@ -416,7 +1222,174 @@ export class DeviceSession {
     return Response.json({ grant_id: grant.id, status: "revoked" });
   }
 
+  private async handleListAuthorizedApps(): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const apps = await sql`
+      select *
+      from apps
+      where type = 'third_party'
+      order by created_at desc
+      limit 100
+    ` as AppRecord[];
+    const rows = [];
+    for (const app of apps) {
+      rows.push({
+        app: await this.hostedAppView(app),
+        grants: await Promise.all((await this.hostedAppGrants(app.id)).map((grant) => this.grantView(grant))),
+        reports: await this.hostedAppReports(app.id),
+      });
+    }
+    return Response.json({ authorized_apps: rows, apps: rows });
+  }
+
+  private async handleReportApp(request: Request, appId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const app = await this.hostedApp(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const body = await request.json().catch(() => ({})) as { reason?: string; description?: string };
+    await this.persistUser({ id: "user_local", name: "Local User" });
+    const report: AppAbuseReportRecord = {
+      id: generatedId("report"),
+      app_id: appId,
+      reporter_user_id: "user_local",
+      reason: body.reason || "other",
+      description: body.description,
+      status: "open",
+      created_at: new Date().toISOString(),
+    };
+    await sql`
+      insert into app_abuse_reports (
+        id, app_id, reporter_user_id, reason, description, status, created_at
+      ) values (
+        ${report.id}, ${report.app_id}, ${report.reporter_user_id ?? null}, ${report.reason},
+        ${report.description ?? null}, ${report.status}, ${report.created_at}
+      )
+    `;
+    await this.audit("user", "user_local", "app.reported", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { report_id: report.id, reason: report.reason },
+    });
+    await this.audit("user", "user_local", "third_party_app.reported", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { report_id: report.id, reason: report.reason },
+    });
+    return Response.json({ report });
+  }
+
+  private async handleSuspendApp(appId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const app = await this.hostedApp(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const now = new Date().toISOString();
+    await sql`
+      update apps
+      set status = 'suspended',
+          disabled_at = ${now},
+          disabled_by = 'admin_local',
+          updated_at = ${now}
+      where id = ${app.id}
+    `;
+    app.status = "suspended";
+    app.disabled_at = now;
+    app.disabled_by = "admin_local";
+    await this.putMapItem("apps", app.id, app);
+    await this.audit("admin", "admin_local", "app.suspended", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_id: app.id },
+    });
+    await this.audit("admin", "admin_local", "third_party_app.suspended", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_id: app.id },
+    });
+    return Response.json({ app: await this.hostedAppView(app) });
+  }
+
+  private async handleRevokeApp(appId: string): Promise<Response> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const app = await this.hostedApp(appId);
+    if (!app) return Response.json({ error: "not found" }, { status: 404 });
+    const now = new Date().toISOString();
+    await sql`
+      update apps
+      set status = 'revoked',
+          revoked_at = ${now},
+          revoked_by = 'user_local',
+          updated_at = ${now}
+      where id = ${app.id}
+    `;
+    await sql`
+      update app_api_keys
+      set status = 'revoked',
+          revoked_at = ${now},
+          revoked_by = 'user_local'
+      where app_id = ${app.id} and status = 'active'
+    `;
+    await sql`
+      update app_device_channel_grants
+      set revoked_at = ${now},
+          revoked_by = 'user_local',
+          updated_at = ${now}
+      where app_id = ${app.id} and revoked_at is null
+    `;
+    app.status = "revoked";
+    app.revoked_at = now;
+    app.revoked_by = "user_local";
+    await this.putMapItem("apps", app.id, app);
+    await this.audit("user", "user_local", "app.revoked", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_id: app.id },
+    });
+    await this.audit("user", "user_local", "third_party_app.revoked", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_id: app.id },
+    });
+    return Response.json({ app_id: app.id, status: app.status });
+  }
+
   private async handleGetApp(appId: string): Promise<Response> {
+    const sql = this.neon();
+    if (sql) {
+      const app = await this.hostedApp(appId);
+      if (!app) return Response.json({ error: "not found" }, { status: 404 });
+      const active_key = (await sql`
+        select *
+        from app_keys
+        where app_id = ${app.id} and status = 'active'
+        order by created_at desc
+        limit 1
+      ` as AppKeyRecord[])[0];
+      const api_keys = await sql`
+        select id, app_id, name, prefix, status, created_at, last_used_at, revoked_at, revoked_by
+        from app_api_keys
+        where app_id = ${app.id}
+        order by created_at asc
+      ` as AppApiKeyRecord[];
+      const grants = await Promise.all((await this.hostedAppGrants(app.id)).map((grant) => this.grantView(grant)));
+      return Response.json({
+        app: await this.hostedAppView(app),
+        active_key,
+        api_keys,
+        grants,
+        recent_messages: [],
+        recent_audit_events: (await sql`
+          select *
+          from audit_events
+          where app_id = ${app.id}
+          order by created_at desc
+          limit 50
+        ` as AuditEventRecord[]),
+      });
+    }
     const app = await this.getMapItem<AppRecord>("apps", appId);
     if (!app) return Response.json({ error: "not found" }, { status: 404 });
     const active_key = (await this.list<AppKeyRecord>("app_keys")).find(
@@ -426,6 +1399,38 @@ export class DeviceSession {
   }
 
   private async handleGetDevice(deviceId: string): Promise<Response> {
+    const sql = this.neon();
+    if (sql) {
+      const device = await this.hostedDevice(deviceId);
+      if (!device) return Response.json({ error: "not found" }, { status: 404 });
+      const status = await this.deviceStatus(deviceId);
+      const active_key = (await sql`
+        select *
+        from device_keys
+        where device_id = ${device.id} and status = 'active'
+        order by created_at desc
+        limit 1
+      ` as DeviceKeyRecord[])[0];
+      return Response.json({
+        device: { ...device, status: device.status === "revoked" ? "revoked" : status },
+        active_key,
+        capabilities: await sql`
+          select *
+          from device_plugin_capabilities
+          where device_id = ${device.id}
+          order by reported_at desc
+        `,
+        grants: await Promise.all((await this.hostedDeviceGrants(device.id)).map((grant) => this.grantView(grant))),
+        recent_messages: [],
+        recent_audit_events: await sql`
+          select *
+          from audit_events
+          where device_id = ${device.id}
+          order by created_at desc
+          limit 50
+        `,
+      });
+    }
     const device = await this.getMapItem<DeviceRecord>("devices", deviceId);
     if (!device) return Response.json({ error: "not found" }, { status: 404 });
     const status = await this.deviceStatus(deviceId);
@@ -436,11 +1441,17 @@ export class DeviceSession {
   }
 
   private async handleCreateMessage(request: Request): Promise<Response> {
+    const auth = readBearer(request) ? await this.authenticateAppRequest(request) : undefined;
+    if (auth instanceof Response) return auth;
     const envelope = await request.json() as MessageEnvelope;
+    if (auth && envelope.app_id !== auth.app.id) {
+      return Response.json({ message_id: envelope.message_id, status: "failed", error: "app id mismatch" }, { status: 403 });
+    }
     const stored: StoredMessage = {
       envelope,
       status: "created",
       history: ["created"],
+      result_events: [],
     };
     await this.putMapItem("messages", envelope.message_id, stored);
     await this.persistMessage(stored);
@@ -500,6 +1511,53 @@ export class DeviceSession {
       status: item.status,
       history: item.history,
       result: item.result,
+      result_events: item.result_events ?? [],
+    });
+  }
+
+  private async handleListMessages(url: URL): Promise<Response> {
+    let messages = await this.list<StoredMessage>("messages");
+    for (const field of ["app_id", "device_id", "channel", "status"] as const) {
+      const value = url.searchParams.get(field);
+      if (!value) continue;
+      messages = messages.filter((item) => field === "status" ? item.status === value : item.envelope[field] === value);
+    }
+    const rows = messages
+      .sort((a, b) => (b.envelope.created_at ?? "").localeCompare(a.envelope.created_at ?? ""))
+      .slice(0, 100)
+      .map((item) => ({
+        id: item.envelope.message_id,
+        message_id: item.envelope.message_id,
+        workspace_id: item.envelope.workspace_id,
+        app_id: item.envelope.app_id,
+        device_id: item.envelope.device_id,
+        channel: item.envelope.channel,
+        status: item.status,
+        created_at: item.envelope.created_at,
+        updated_at: item.envelope.created_at,
+        duration_ms: null,
+        crypto: {
+          version: (item.envelope.crypto as any)?.version,
+          alg: (item.envelope.crypto as any)?.alg,
+          sender_key_id: (item.envelope.crypto as any)?.sender_key_id,
+          recipient_key_id: (item.envelope.crypto as any)?.recipient_key_id,
+          payload_size: item.envelope.ciphertext.length,
+        },
+      }));
+    return Response.json({ messages: rows, next_cursor: null });
+  }
+
+  private async handleGetMessageEvents(messageId: string, url: URL): Promise<Response> {
+    const item = await this.getMapItem<StoredMessage>("messages", messageId);
+    if (!item) return Response.json({ error: "not found" }, { status: 404 });
+    const cursor = Math.max(0, Number(url.searchParams.get("cursor") ?? 0));
+    const events = (item.result_events ?? []).slice(cursor);
+    return Response.json({
+      message_id: item.envelope.message_id,
+      status: item.status,
+      cursor,
+      next_cursor: String(cursor + events.length),
+      events,
     });
   }
 
@@ -515,9 +1573,86 @@ export class DeviceSession {
   }
 
   private async handleGetAuditEvents(messageId: string | null): Promise<Response> {
-    const events = await this.list<AuditEventRecord>("audit_events");
+    const sql = this.neon();
+    const events = sql
+      ? await sql`select * from audit_events order by created_at desc limit 100` as AuditEventRecord[]
+      : await this.list<AuditEventRecord>("audit_events");
     return Response.json({
       audit_events: messageId ? events.filter((event) => event.message_id === messageId) : events,
+    });
+  }
+
+  private async handleListGrantedAppDevices(request: Request): Promise<Response> {
+    const auth = await this.authenticateAppRequest(request);
+    if (auth instanceof Response) return auth;
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const rows = await sql`
+      select
+        devices.id,
+        devices.name,
+        devices.status,
+        devices.platform,
+        devices.workspace_id,
+        devices.last_seen_at,
+        devices.last_capability_report_at,
+        app_device_channel_grants.allowed_channels,
+        app_device_channel_grants.queueing_allowed
+      from app_device_channel_grants
+      join devices on devices.id = app_device_channel_grants.device_id
+      where app_device_channel_grants.app_id = ${auth.app.id}
+        and app_device_channel_grants.revoked_at is null
+        and devices.revoked_at is null
+        and devices.status != 'revoked'
+      order by devices.created_at asc
+    ` as any[];
+    return Response.json({
+      devices: rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        status: row.status,
+        platform: row.platform,
+        workspace_id: row.workspace_id,
+        allowed_channels: row.allowed_channels,
+        queueing_allowed: row.queueing_allowed,
+        last_seen_at: row.last_seen_at,
+        last_capability_report_at: row.last_capability_report_at,
+      })),
+    });
+  }
+
+  private async handleGetAppDevicePublicKey(request: Request, deviceId: string): Promise<Response> {
+    const auth = await this.authenticateAppRequest(request);
+    if (auth instanceof Response) return auth;
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const grant = (await sql`
+      select app_device_channel_grants.*
+      from app_device_channel_grants
+      join devices on devices.id = app_device_channel_grants.device_id
+      where app_device_channel_grants.app_id = ${auth.app.id}
+        and app_device_channel_grants.device_id = ${deviceId}
+        and app_device_channel_grants.revoked_at is null
+        and devices.revoked_at is null
+        and devices.status != 'revoked'
+      order by app_device_channel_grants.created_at desc
+      limit 1
+    ` as GrantRecord[])[0];
+    if (!grant) return Response.json({ error: "grant denied" }, { status: 403 });
+    const key = (await sql`
+      select *
+      from device_keys
+      where device_id = ${deviceId}
+        and status = 'active'
+      order by created_at desc
+      limit 1
+    ` as DeviceKeyRecord[])[0];
+    if (!key) return Response.json({ error: "device key denied" }, { status: 404 });
+    return Response.json({
+      device_id: deviceId,
+      device_key_id: key.id,
+      public_key: key.public_key,
+      allowed_channels: grant.allowed_channels,
     });
   }
 
@@ -613,6 +1748,21 @@ export class DeviceSession {
   private async handleInternalControl(request: Request, url: URL): Promise<Response> {
     const activeKeyMatch = url.pathname.match(/^\/internal\/control\/devices\/([^/]+)\/active-key$/);
     if (activeKeyMatch) {
+      const sql = this.neon();
+      if (sql) {
+        const active_key = (await sql`
+          select device_keys.*
+          from device_keys
+          join devices on devices.id = device_keys.device_id
+          where device_keys.device_id = ${activeKeyMatch[1]}
+            and device_keys.status = 'active'
+            and devices.revoked_at is null
+            and devices.status != 'revoked'
+          order by device_keys.created_at desc
+          limit 1
+        ` as DeviceKeyRecord[])[0];
+        return active_key ? Response.json({ active_key }) : Response.json({ error: "not found" }, { status: 404 });
+      }
       const active_key = (await this.list<DeviceKeyRecord>("device_keys")).find(
         (key) => key.device_id === activeKeyMatch[1] && key.status === "active",
       );
@@ -621,6 +1771,11 @@ export class DeviceSession {
 
     const workspaceMatch = url.pathname.match(/^\/internal\/control\/devices\/([^/]+)\/workspace$/);
     if (workspaceMatch) {
+      const sql = this.neon();
+      if (sql) {
+        const hostedDevice = await this.hostedDevice(workspaceMatch[1]);
+        return hostedDevice ? Response.json({ workspace_id: hostedDevice.workspace_id }) : Response.json({ error: "not found" }, { status: 404 });
+      }
       const device = await this.getMapItem<DeviceRecord>("devices", workspaceMatch[1]);
       return Response.json({ workspace_id: device?.workspace_id ?? "ws_unknown" });
     }
@@ -643,11 +1798,12 @@ export class DeviceSession {
       const result = await request.json() as ResultEnvelope;
       const item = await this.getMapItem<StoredMessage>("messages", result.message_id);
       if (item) {
+        item.result_events = [...(item.result_events ?? []), result];
         if (isTerminalMessageState(result.status)) {
           item.result = result;
-          await this.putMapItem("messages", result.message_id, item);
-          await this.persistMessage(item);
         }
+        await this.putMapItem("messages", result.message_id, item);
+        await this.persistMessage(item);
         await this.transition(result.message_id, result.status);
       }
       return Response.json({ ok: true });
@@ -659,8 +1815,10 @@ export class DeviceSession {
         status: "offline" | "online";
         last_seen_at: string;
       };
-      const device = await this.getMapItem<DeviceRecord>("devices", body.device_id);
+      const sql = this.neon();
+      const device = sql ? await this.hostedDevice(body.device_id) : await this.getMapItem<DeviceRecord>("devices", body.device_id);
       if (!device) return Response.json({ error: "not found" }, { status: 404 });
+      if (device.status === "revoked" || device.revoked_at) return Response.json({ error: "device revoked" }, { status: 409 });
       device.status = body.status;
       device.last_seen_at = body.last_seen_at;
       await this.putMapItem("devices", body.device_id, device);
@@ -754,6 +1912,36 @@ export class DeviceSession {
   }
 
   private async checkGrant(workspaceId: string, appId: string, deviceId: string, channel: string): Promise<string | undefined> {
+    const sql = this.neon();
+    if (sql) {
+      const app = await this.hostedApp(appId);
+      if (!app || app.workspace_id !== workspaceId || app.status !== "active") return app?.status === "suspended" ? "app suspended" : "app denied";
+      if (app.trust_status === "blocked") return "app blocked";
+      const publisher = app.publisher_id ? await this.hostedPublisher(app.publisher_id) : undefined;
+      if (publisher?.verification_status === "suspended") return "publisher suspended";
+      if (app.type === "third_party" && !(await this.hostedDeclaresChannel(app.id, channel))) return "undeclared channel denied";
+      const device = await this.hostedDevice(deviceId);
+      if (!device || device.workspace_id !== workspaceId) return "device denied";
+      if (device.status === "revoked" || device.revoked_at) return "device revoked";
+      const activeAppKey = (await sql`
+        select id
+        from app_keys
+        where app_id = ${appId} and status = 'active'
+        limit 1
+      ` as any[])[0];
+      if (!activeAppKey) return "app key denied";
+      const activeDeviceKey = (await sql`
+        select id
+        from device_keys
+        where device_id = ${deviceId} and status = 'active'
+        limit 1
+      ` as any[])[0];
+      if (!activeDeviceKey) return "device key denied";
+      const grant = await this.activeGrantFor(workspaceId, appId, deviceId, channel);
+      if (!grant) return "grant denied";
+      if (!grant.allowed_channels.includes(channel)) return "channel denied";
+      return undefined;
+    }
     const app = await this.getMapItem<AppRecord>("apps", appId);
     if (!app || app.status !== "active") return "app denied";
     const device = await this.getMapItem<DeviceRecord>("devices", deviceId);
@@ -771,6 +1959,19 @@ export class DeviceSession {
   }
 
   private async activeGrantFor(workspaceId: string, appId: string, deviceId: string, channel: string): Promise<GrantRecord | undefined> {
+    const sql = this.neon();
+    if (sql) {
+      return (await sql`
+        select *
+        from app_device_channel_grants
+        where workspace_id = ${workspaceId}
+          and app_id = ${appId}
+          and device_id = ${deviceId}
+          and revoked_at is null
+        order by created_at desc
+        limit 1
+      ` as GrantRecord[]).find((grant) => grant.allowed_channels.includes(channel));
+    }
     return (await this.list<GrantRecord>("grants")).find(
       (grant) =>
         grant.workspace_id === workspaceId &&
@@ -782,6 +1983,32 @@ export class DeviceSession {
   }
 
   private async checkGrantPreconditions(workspaceId: string, appId: string, deviceId: string): Promise<string | undefined> {
+    const sql = this.neon();
+    if (sql) {
+      const app = await this.hostedApp(appId);
+      if (!app || app.workspace_id !== workspaceId || app.status !== "active") return "app denied";
+      if (app.trust_status === "blocked") return "app blocked";
+      const publisher = app.publisher_id ? await this.hostedPublisher(app.publisher_id) : undefined;
+      if (publisher?.verification_status === "suspended") return "publisher suspended";
+      const device = await this.hostedDevice(deviceId);
+      if (!device || device.workspace_id !== workspaceId) return "device denied";
+      if (device.status === "revoked" || device.revoked_at) return "device revoked";
+      const activeAppKey = (await sql`
+        select id
+        from app_keys
+        where app_id = ${appId} and status = 'active'
+        limit 1
+      ` as any[])[0];
+      if (!activeAppKey) return "app key denied";
+      const activeDeviceKey = (await sql`
+        select id
+        from device_keys
+        where device_id = ${deviceId} and status = 'active'
+        limit 1
+      ` as any[])[0];
+      if (!activeDeviceKey) return "device key denied";
+      return undefined;
+    }
     const app = await this.getMapItem<AppRecord>("apps", appId);
     if (!app || app.workspace_id !== workspaceId || app.status !== "active") return "app denied";
     const device = await this.getMapItem<DeviceRecord>("devices", deviceId);
@@ -832,9 +2059,26 @@ export class DeviceSession {
       metadata?: Record<string, unknown>;
     },
   ) {
-    const events = await this.list<AuditEventRecord>("audit_events");
-    const event: AuditEventRecord = {
-      id: `audit_${String(events.length + 1).padStart(6, "0")}`,
+    const event = this.auditEvent(actorType, actorId, eventType, fields);
+    await this.putMapItem("audit_events", event.id, event);
+    await this.persistAuditEvent(event);
+  }
+
+  private auditEvent(
+    actorType: string,
+    actorId: string | undefined,
+    eventType: string,
+    fields: {
+      workspace_id: string;
+      app_id?: string;
+      device_id?: string;
+      message_id?: string;
+      channel?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): AuditEventRecord {
+    return {
+      id: generatedId("audit"),
       workspace_id: fields.workspace_id,
       actor_type: actorType,
       actor_id: actorId,
@@ -846,8 +2090,6 @@ export class DeviceSession {
       metadata: fields.metadata ?? {},
       created_at: new Date().toISOString(),
     };
-    await this.putMapItem("audit_events", event.id, event);
-    await this.persistAuditEvent(event);
   }
 
   private async persistMessage(item: StoredMessage) {
@@ -936,7 +2178,9 @@ export class DeviceSession {
         cli_version,
         status,
         last_seen_at,
+        last_capability_report_at,
         created_at,
+        revoked_by,
         revoked_at
       ) values (
         ${device.id},
@@ -947,16 +2191,23 @@ export class DeviceSession {
         ${device.cli_version},
         ${device.status},
         ${device.last_seen_at ?? null},
+        ${device.last_capability_report_at ?? null},
         ${device.created_at},
-        ${null}
+        ${device.revoked_by ?? null},
+        ${device.revoked_at ?? null}
       )
       on conflict (id) do update set
         name = excluded.name,
         platform = excluded.platform,
         cli_version = excluded.cli_version,
-        status = excluded.status,
+        status = case
+          when devices.status = 'revoked' or devices.revoked_at is not null then devices.status
+          else excluded.status
+        end,
         last_seen_at = excluded.last_seen_at,
-        revoked_at = excluded.revoked_at
+        last_capability_report_at = excluded.last_capability_report_at,
+        revoked_by = coalesce(devices.revoked_by, excluded.revoked_by),
+        revoked_at = coalesce(devices.revoked_at, excluded.revoked_at)
     `;
   }
 
@@ -1002,25 +2253,58 @@ export class DeviceSession {
         id,
         workspace_id,
         name,
+        description,
         type,
         status,
+        publisher_id,
+        website,
+        privacy_policy_url,
+        terms_url,
+        trust_status,
+        review_status,
         created_by,
         created_at,
+        updated_at,
+        disabled_at,
+        disabled_by,
+        revoked_by,
         revoked_at
       ) values (
         ${app.id},
         ${app.workspace_id},
         ${app.name},
+        ${app.description ?? null},
         ${app.type},
         ${app.status},
+        ${app.publisher_id ?? null},
+        ${app.website ?? null},
+        ${app.privacy_policy_url ?? null},
+        ${app.terms_url ?? null},
+        ${app.trust_status ?? (app.type === "third_party" ? "unverified" : "official")},
+        ${app.review_status ?? "approved"},
         ${null},
         ${app.created_at},
-        ${null}
+        ${app.updated_at ?? null},
+        ${app.disabled_at ?? null},
+        ${app.disabled_by ?? null},
+        ${app.revoked_by ?? null},
+        ${app.revoked_at ?? null}
       )
       on conflict (id) do update set
         name = excluded.name,
+        description = excluded.description,
         type = excluded.type,
         status = excluded.status,
+        publisher_id = excluded.publisher_id,
+        website = excluded.website,
+        privacy_policy_url = excluded.privacy_policy_url,
+        terms_url = excluded.terms_url,
+        trust_status = excluded.trust_status,
+        review_status = excluded.review_status,
+        updated_at = excluded.updated_at,
+        disabled_at = excluded.disabled_at,
+        disabled_by = excluded.disabled_by,
+        revoked_by = excluded.revoked_by,
         revoked_at = excluded.revoked_at
     `;
   }
@@ -1059,31 +2343,50 @@ export class DeviceSession {
     const sql = this.neon();
     if (!sql) return;
 
-    await sql`
+    await this.persistGrantQuery(sql, grant);
+  }
+
+  private persistGrantQuery(sql: any, grant: GrantRecord) {
+    return sql`
       insert into app_device_channel_grants (
         id,
         workspace_id,
         app_id,
         device_id,
+        name,
+        description,
         allowed_channels,
         queueing_allowed,
+        created_from_consent_request_id,
         created_by,
         created_at,
+        updated_at,
+        revoked_by,
         revoked_at
       ) values (
         ${grant.id},
         ${grant.workspace_id},
         ${grant.app_id},
         ${grant.device_id},
+        ${grant.name ?? null},
+        ${grant.description ?? null},
         ${grant.allowed_channels},
         ${grant.queueing_allowed},
+        ${grant.created_from_consent_request_id ?? null},
         ${null},
         ${grant.created_at},
+        ${grant.updated_at ?? null},
+        ${grant.revoked_by ?? null},
         ${grant.revoked_at ?? null}
       )
       on conflict (id) do update set
+        name = excluded.name,
+        description = excluded.description,
         allowed_channels = excluded.allowed_channels,
         queueing_allowed = excluded.queueing_allowed,
+        created_from_consent_request_id = excluded.created_from_consent_request_id,
+        updated_at = excluded.updated_at,
+        revoked_by = excluded.revoked_by,
         revoked_at = excluded.revoked_at
     `;
   }
@@ -1092,7 +2395,11 @@ export class DeviceSession {
     const sql = this.neon();
     if (!sql) return;
 
-    await sql`
+    await this.persistAuditEventQuery(sql, event);
+  }
+
+  private persistAuditEventQuery(sql: any, event: AuditEventRecord) {
+    return sql`
       insert into audit_events (
         id,
         workspace_id,
@@ -1157,6 +2464,200 @@ export class DeviceSession {
     `;
   }
 
+  private neonRequired() {
+    const sql = this.neon();
+    if (!sql) {
+      return Response.json({ error: "neon required for hosted trust state" }, { status: 503 });
+    }
+    return sql;
+  }
+
+  private async hostedApp(appId: string): Promise<AppRecord | undefined> {
+    const sql = this.neon();
+    if (!sql) return undefined;
+    return (await sql`
+      select *
+      from apps
+      where id = ${appId}
+      limit 1
+    ` as AppRecord[])[0];
+  }
+
+  private async hostedDevice(deviceId: string): Promise<DeviceRecord | undefined> {
+    const sql = this.neon();
+    if (!sql) return undefined;
+    return (await sql`
+      select *
+      from devices
+      where id = ${deviceId}
+      limit 1
+    ` as DeviceRecord[])[0];
+  }
+
+  private async hostedPublisher(publisherId: string): Promise<PublisherRecord | undefined> {
+    const sql = this.neon();
+    if (!sql) return undefined;
+    return (await sql`
+      select *
+      from publisher_profiles
+      where id = ${publisherId}
+      limit 1
+    ` as PublisherRecord[])[0];
+  }
+
+  private async hostedConsent(consentId: string): Promise<ConsentRequestRecord | undefined> {
+    const sql = this.neon();
+    if (!sql) return undefined;
+    return (await sql`
+      select *
+      from consent_requests
+      where id = ${consentId}
+      limit 1
+    ` as ConsentRequestRecord[])[0];
+  }
+
+  private async hostedGrant(grantId: string): Promise<GrantRecord | undefined> {
+    const sql = this.neon();
+    if (!sql) return undefined;
+    return (await sql`
+      select *
+      from app_device_channel_grants
+      where id = ${grantId}
+      limit 1
+    ` as GrantRecord[])[0];
+  }
+
+  private async hostedPermissionDeclarations(appId: string): Promise<PermissionDeclarationRecord[]> {
+    const sql = this.neon();
+    if (!sql) return [];
+    return await sql`
+      select *
+      from app_permission_declarations
+      where app_id = ${appId}
+      order by created_at asc
+    ` as PermissionDeclarationRecord[];
+  }
+
+  private async hostedDeclaresChannel(appId: string, channel: string): Promise<boolean> {
+    const declarations = await this.hostedPermissionDeclarations(appId);
+    if (declarations.length === 0) return false;
+    return declarations.some((declaration) => declaration.channels.includes(channel));
+  }
+
+  private async hostedAppGrants(appId: string): Promise<GrantRecord[]> {
+    const sql = this.neon();
+    if (!sql) return [];
+    return await sql`
+      select *
+      from app_device_channel_grants
+      where app_id = ${appId}
+      order by created_at desc
+    ` as GrantRecord[];
+  }
+
+  private async hostedDeviceGrants(deviceId: string): Promise<GrantRecord[]> {
+    const sql = this.neon();
+    if (!sql) return [];
+    return await sql`
+      select *
+      from app_device_channel_grants
+      where device_id = ${deviceId}
+      order by created_at desc
+    ` as GrantRecord[];
+  }
+
+  private async hostedAppReports(appId: string): Promise<AppAbuseReportRecord[]> {
+    const sql = this.neon();
+    if (!sql) return [];
+    return await sql`
+      select *
+      from app_abuse_reports
+      where app_id = ${appId}
+      order by created_at desc
+    ` as AppAbuseReportRecord[];
+  }
+
+  private async hostedAppView(app: AppRecord | any) {
+    const publisher = app.publisher_id ? await this.hostedPublisher(app.publisher_id) : undefined;
+    const grants = await this.hostedAppGrants(app.id);
+    return {
+      ...app,
+      publisher,
+      permission_declarations: await this.hostedPermissionDeclarations(app.id),
+      authorized_device_count: new Set(grants.filter((grant) => !grant.revoked_at).map((grant) => grant.device_id)).size,
+      allowed_channel_count: new Set(grants.filter((grant) => !grant.revoked_at).flatMap((grant) => grant.allowed_channels)).size,
+    };
+  }
+
+  private async grantView(grant: GrantRecord) {
+    return {
+      ...grant,
+      status: grant.revoked_at ? "revoked" : "active",
+      app: await this.hostedApp(grant.app_id) ?? await this.getMapItem<AppRecord>("apps", grant.app_id),
+      device: await this.hostedDevice(grant.device_id) ?? await this.getMapItem<DeviceRecord>("devices", grant.device_id),
+    };
+  }
+
+  private async createAppApiKey(app: AppRecord, name: string): Promise<{ secret: string; key: AppApiKeyRecord }> {
+    const sql = this.neonRequired();
+    if (sql instanceof Response) throw new Error("neon required for hosted trust state");
+    const secret = `musubi_app_sk_${randomBase64Url(24)}`;
+    const key: AppApiKeyRecord = {
+      id: generatedId("appapikey"),
+      app_id: app.id,
+      name,
+      prefix: secret.slice(0, 18),
+      key_hash: await sha256Hex(secret),
+      status: "active",
+      created_at: new Date().toISOString(),
+    };
+    await sql`
+      insert into app_api_keys (
+        id, app_id, name, prefix, key_hash, status, created_at
+      ) values (
+        ${key.id}, ${key.app_id}, ${key.name}, ${key.prefix}, ${key.key_hash}, ${key.status}, ${key.created_at}
+      )
+    `;
+    await this.audit("user", "user_local", "app_api_key.created", {
+      workspace_id: app.workspace_id,
+      app_id: app.id,
+      metadata: { app_api_key_id: key.id, prefix: key.prefix },
+    });
+    return { secret, key };
+  }
+
+  private appApiKeyView(key: AppApiKeyRecord) {
+    const { key_hash: _keyHash, ...view } = key;
+    return view;
+  }
+
+  private async authenticateAppRequest(request: Request): Promise<AppAuth | Response> {
+    const token = readBearer(request);
+    if (!token) return Response.json({ error: "missing app api key" }, { status: 401 });
+    const sql = this.neonRequired();
+    if (sql instanceof Response) return sql;
+    const keyHash = await sha256Hex(token);
+    const apiKey = (await sql`
+      select *
+      from app_api_keys
+      where key_hash = ${keyHash}
+        and status = 'active'
+      limit 1
+    ` as AppApiKeyRecord[])[0];
+    if (!apiKey) return Response.json({ error: "invalid app api key" }, { status: 401 });
+    const app = await this.hostedApp(apiKey.app_id);
+    if (!app || app.status !== "active") return Response.json({ error: app?.status === "suspended" ? "app suspended" : "app denied" }, { status: 403 });
+    if (app.trust_status === "blocked") return Response.json({ error: "app blocked" }, { status: 403 });
+    const publisher = app.publisher_id ? await this.hostedPublisher(app.publisher_id) : undefined;
+    if (publisher?.verification_status === "suspended") return Response.json({ error: "publisher suspended" }, { status: 403 });
+    await sql`
+      update app_api_keys
+      set last_used_at = ${new Date().toISOString()}
+      where id = ${apiKey.id}
+    `;
+    return { app, apiKey };
+  }
+
   private neon() {
     if (!this.env.NEON_DATABASE_URL) return undefined;
     return neon(this.env.NEON_DATABASE_URL);
@@ -1209,4 +2710,35 @@ function base64ToBytes(input: string): Uint8Array {
     bytes[index] = binary.charCodeAt(index);
   }
   return bytes;
+}
+
+function readBearer(request: Request): string | undefined {
+  const header = request.headers.get("Authorization");
+  if (!header?.startsWith("Bearer ")) return undefined;
+  return header.slice("Bearer ".length).trim();
+}
+
+function generatedId(prefix: string): string {
+  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+}
+
+function randomBase64Url(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function callbackUrl(base: string, state: string | undefined, status: string, grantId?: string): string {
+  const url = new URL(base);
+  url.searchParams.set("status", status);
+  if (state) url.searchParams.set("state", state);
+  if (grantId) url.searchParams.set("grant_id", grantId);
+  return url.toString();
 }

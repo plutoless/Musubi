@@ -221,6 +221,20 @@ bun run verify:slice11:deployed
 
 A real hosted deployment still requires Cloudflare authentication and Neon configuration.
 
+For repeated hosted verifier runs, copy `.env.example` to `.env.local` and fill in the real values:
+
+```bash
+NEON_DATABASE_URL="<postgres-url>"
+MUSUBI_HOSTED_URL="https://<worker-host>"
+```
+
+The M4 hosted verifiers load `.env.local` automatically, so future runs do not need the variables repeated inline:
+
+```bash
+bun run verify:m4-hosted-local
+bun run verify:m4-hosted-deployed
+```
+
 Hermes runtime integration is implemented as a plugin-local process adapter. Configure `HERMES_COMMAND` to point at the real Hermes local runtime; see [plugins/hermes/README.md](plugins/hermes/README.md).
 
 ### M1.5 Codex Verification

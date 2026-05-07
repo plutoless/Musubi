@@ -1,14 +1,16 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { neon } from "@neondatabase/serverless";
+import { loadEnvFiles } from "./env.ts";
 
+loadEnvFiles();
 const hostedUrl = process.env.MUSUBI_HOSTED_URL;
 const databaseUrl = process.env.NEON_DATABASE_URL;
 if (!hostedUrl) {
-  throw new Error("MUSUBI_HOSTED_URL is required, for example https://musubi-m1.<account>.workers.dev");
+  throw new Error("MUSUBI_HOSTED_URL is required, for example https://musubi-m1.<account>.workers.dev. Set it in the shell or in .env.local; see .env.example.");
 }
 if (!databaseUrl) {
-  throw new Error("NEON_DATABASE_URL is required so the deployed verifier can prove hosted message/audit persistence");
+  throw new Error("NEON_DATABASE_URL is required so the deployed verifier can prove hosted message/audit persistence. Set it in the shell or in .env.local; see .env.example.");
 }
 
 const serverUrl = hostedUrl.replace(/\/$/, "");
@@ -26,9 +28,9 @@ let appId = "";
 try {
   await ensureHealth();
   const deviceOutput = await run("go", ["run", "./cmd/musubi", "device", "register", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
-  deviceId = requiredMatch(deviceOutput, /registered device (dev_\d+)/, "device id");
+  deviceId = requiredMatch(deviceOutput, /registered device (dev_[a-z0-9]+)/, "device id");
   const appOutput = await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Hermes Web", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
-  appId = requiredMatch(appOutput, /created app (app_\d+)/, "app id");
+  appId = requiredMatch(appOutput, /created app (app_[a-z0-9]+)/, "app id");
   await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: workspaceId,
     app_id: appId,
