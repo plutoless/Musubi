@@ -2635,6 +2635,7 @@ export class DeviceSession {
   private async handleGetMessage(messageId: string): Promise<Response> {
     const sql = this.neon();
     if (sql) {
+      const item = await this.getMapItem<StoredMessage>("messages", messageId);
       const row = (await sql`
         select
           messages.*,
@@ -2664,6 +2665,7 @@ export class DeviceSession {
         ` as Promise<AuditEventRecord[]>,
       ]);
       const crypto = messageCryptoView(row);
+      const history = item?.history?.length ? item.history : statusEvents.map((event) => event.status);
       const message = {
         id: row.id,
         message_id: row.id,
@@ -2682,9 +2684,9 @@ export class DeviceSession {
       return Response.json({
         message_id: row.id,
         status: row.status,
-        history: statusEvents.map((event) => event.status),
-        result: undefined,
-        result_events: [],
+        history,
+        result: item?.result,
+        result_events: item?.result_events ?? [],
         message,
         status_events: statusEvents,
         audit_events: auditEvents,
