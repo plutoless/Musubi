@@ -1589,7 +1589,15 @@ export function startRelay(options: { hostname?: string; port?: number } = {}) {
       }
 
       if (url.pathname === "/v1/plugin-registry/resolve" && req.method === "GET") {
-        const plugin = registryPluginResponse(url.searchParams.get("name") ?? "", url.searchParams.get("version") ?? "latest");
+        const requestedName = url.searchParams.get("name") ?? "";
+        const requestedVersion = url.searchParams.get("version") ?? "latest";
+        const plugin = registryPluginResponse(requestedName, requestedVersion);
+        if (plugin) {
+          audit("user", "user_local", requestedVersion === "latest" ? "plugin.update_checked" : "plugin.registry_resolved", {
+            workspace_id: "ws_local",
+            metadata: { plugin_name: requestedName, requested_version: requestedVersion, resolved_version: plugin.plugin.version },
+          });
+        }
         return plugin ? Response.json(plugin) : Response.json({ error: "not found" }, { status: 404 });
       }
 

@@ -39,3 +39,5 @@ go run ./cmd/musubi plugin update-check codex \
 ```
 
 The update check compares the installed record with the latest registry manifest and prints new permissions or channels before an update is accepted.
+
+Registry resolution records `plugin.registry_resolved`, and latest-version checks record `plugin.update_checked`, so install, update review, and device report activity are visible in audit history.

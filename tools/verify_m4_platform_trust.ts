@@ -146,7 +146,7 @@ try {
   if (!JSON.stringify(authorized).includes("suspicious")) throw new Error("authorized apps did not include report");
 
   const audit = await requestJson<any>(`${serverUrl}/v1/audit-events`);
-  for (const event of ["developer.created", "publisher.created", "app.permission_declared", "consent.approved", "grant.revoked", "app.reported", "app.suspended", "plugin.install_reported", "message.completed"]) {
+  for (const event of ["developer.created", "publisher.created", "app.permission_declared", "consent.approved", "grant.revoked", "app.reported", "app.suspended", "plugin.install_reported", "plugin.update_checked", "message.completed"]) {
     if (!audit.audit_events.find((item: any) => item.event_type === event)) throw new Error(`missing audit event ${event}`);
   }
 } finally {
