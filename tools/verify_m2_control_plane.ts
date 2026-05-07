@@ -174,16 +174,17 @@ try {
   await postJson(`${serverUrl}/v1/apps/app_001/revoke`, {});
   await expectSendDenied("app_001", "hermes.task.create", "M2_APP_REVOKED_SECRET", "app denied");
 
-  await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Device Revoke Test", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
+  const revokeDeviceAppOutput = await run("go", ["run", "./cmd/musubi", "dev", "app", "create", "Device Revoke Test", "--server", serverUrl, "--home", home, "--workspace", workspaceId]);
+  const revokeDeviceAppId = requiredMatch(revokeDeviceAppOutput, /created app (app_\d+)/, "device revoke app id");
   await expectPagedList(`${serverUrl}/v1/apps`, "apps");
   await postJson(`${serverUrl}/v1/grants`, {
     workspace_id: workspaceId,
-    app_id: "app_002",
+    app_id: revokeDeviceAppId,
     device_id: "dev_001",
     allowed_channels: ["hermes.task.create"],
   });
   await postJson(`${serverUrl}/v1/devices/dev_001/revoke`, {});
-  await expectSendDenied("app_002", "hermes.task.create", "M2_DEVICE_REVOKED_SECRET", "device revoked");
+  await expectSendDenied(revokeDeviceAppId, "hermes.task.create", "M2_DEVICE_REVOKED_SECRET", "device revoked");
   const revokedDevice = await requestJson(`${serverUrl}/v1/devices/dev_001`);
   if (revokedDevice.device.status !== "revoked") throw new Error("device detail did not show revoked status");
 
