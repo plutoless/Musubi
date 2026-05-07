@@ -23,7 +23,7 @@
     "verify:slice10": "bun run tools/verify_slice10.ts",
     "verify:slice10:hermes": "MUSUBI_HERMES_COMMAND=\"/Users/zhangqianze/.local/bin/hermes -z\" MUSUBI_HERMES_PROMPT=\"Reply with exactly: hermes-runtime-ok\" MUSUBI_HERMES_EXPECT=\"hermes-runtime-ok\" bun run tools/verify_slice10.ts",
     "verify:slice11": "bun run tools/verify_slice11.ts",
-    "verify:slice11:build": "cd server/workers && TMPDIR=\"../../.cache/tmp\" BUN_INSTALL_CACHE_DIR=\"../../.cache/bun\" bunx wrangler deploy --dry-run --outdir ../../.cache/worker-build",
+    "verify:slice11:build": "cd server/workers && TMPDIR=\"../../.cache/tmp\" BUN_INSTALL_CACHE_DIR=\"../../.cache/bun\" bunx wrangler deploy --env=\"\" --dry-run --outdir ../../.cache/worker-build",
     "verify:slice11:local": "bun run tools/verify_slice11_hosted_local.ts",
     "verify:slice11:deployed": "bun run tools/verify_slice11_deployed.ts",
     "verify:slice12": "bun run tools/verify_slice12_codex.ts",
@@ -38,6 +38,7 @@
     "verify:m4-platform-trust": "bun run tools/verify_m4_platform_trust.ts",
     "verify:m4-hosted-local": "bun run tools/verify_m4_hosted_local.ts",
     "verify:m4-hosted-deployed": "bun run tools/verify_m4_hosted_deployed.ts",
+    "verify:production-smoke": "bun run tools/verify_production_smoke.ts",
     "verify:m1-readiness": "bun run tools/verify_m1_readiness.ts"
   },
   "devDependencies": {},

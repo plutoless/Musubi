@@ -11,7 +11,16 @@ tag = "v1"
 new_sqlite_classes = ["DeviceSession"]
 
 [vars]
-MUSUBI_ENV = "m1"
+MUSUBI_ENV = "production"
+
+[env.staging]
+
+[[env.staging.durable_objects.bindings]]
+name = "DEVICE_SESSION"
+class_name = "DeviceSession"
+
+[env.staging.vars]
+MUSUBI_ENV = "staging"
 
 # Configure in Cloudflare dashboard or wrangler secret:
 # NEON_DATABASE_URL

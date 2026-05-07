@@ -6,8 +6,10 @@ This runbook describes the hosted target for Musubi M1: Cloudflare Workers, a Du
 
 - Cloudflare account with Workers and Durable Objects enabled.
 - `wrangler` authenticated for the target account.
-- Neon Postgres database.
-- `NEON_DATABASE_URL` stored as a Wrangler secret.
+- Separate staging and production Neon Postgres databases.
+- `NEON_DATABASE_URL` stored as a Wrangler secret for each Worker environment:
+  - production/default Worker: `musubi-m1`
+  - staging Worker: `musubi-m1-staging`
 
 Local tooling check:
 
@@ -62,9 +64,11 @@ migrations/001_init.sql
 migrations/002_keys.sql
 migrations/003_messages_audit.sql
 migrations/004_device_plugin_capabilities.sql
+migrations/005_control_plane_m2.sql
+migrations/006_third_party_app_platform_m4.sql
 ```
 
-The hosted Worker uses `NEON_DATABASE_URL` for message and audit persistence. Apply the schema before sending hosted messages.
+The hosted Worker uses `NEON_DATABASE_URL` for message and audit persistence. Apply the schema for the target Neon database before sending hosted messages.
 
 Apply migrations:
 
@@ -74,12 +78,20 @@ NEON_DATABASE_URL="<postgres-url>" bun run db:migrate:neon
 
 ## Deploy
 
-From the repo root:
+Production deploys the default Worker `musubi-m1`:
 
 ```bash
 cd server/workers
 TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler secret put NEON_DATABASE_URL
-TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler deploy
+TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler deploy --env=""
+```
+
+Staging deploys the Wrangler environment Worker `musubi-m1-staging`:
+
+```bash
+cd server/workers
+TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler secret put NEON_DATABASE_URL --env staging
+TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler deploy --env staging
 ```
 
 Health check:
@@ -94,16 +106,18 @@ Expected:
 {
   "ok": true,
   "service": "musubi-worker",
-  "env": "m1",
+  "env": "production",
   "neon_configured": true
 }
 ```
+
+Staging should report `"env": "staging"`.
 
 Build check without deploying:
 
 ```bash
 cd server/workers
-TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler deploy --dry-run --outdir ../../.cache/worker-build
+TMPDIR="../../.cache/tmp" BUN_INSTALL_CACHE_DIR="../../.cache/bun" bunx wrangler deploy --env="" --dry-run --outdir ../../.cache/worker-build
 ```
 
 Equivalent repo-root script:
@@ -129,6 +143,47 @@ bun run verify:slice11:deployed
 ```
 
 The deployed verifier registers a local Go CLI device against the deployed Worker, creates a Hermes app/grant, sends an encrypted `hermes.task.create`, verifies the decrypted result, and queries Neon for the message and audit rows.
+
+Staging should run the full deployed verifier suite against the staging Worker and database:
+
+```bash
+MUSUBI_HOSTED_URL="https://<staging-worker-host>" \
+NEON_DATABASE_URL="<staging-postgres-url>" \
+bun run verify:slice11:deployed
+
+MUSUBI_HOSTED_URL="https://<staging-worker-host>" \
+NEON_DATABASE_URL="<staging-postgres-url>" \
+bun run verify:slice12:deployed
+
+MUSUBI_HOSTED_URL="https://<staging-worker-host>" \
+NEON_DATABASE_URL="<staging-postgres-url>" \
+bun run verify:slice13:deployed
+
+MUSUBI_HOSTED_URL="https://<staging-worker-host>" \
+NEON_DATABASE_URL="<staging-postgres-url>" \
+bun run verify:m4-hosted-deployed
+```
+
+Production should use only the smoke verifier because the full deployed suite creates apps, grants, consent requests, reports, suspensions, messages, and audit rows:
+
+```bash
+MUSUBI_HOSTED_URL="https://<production-worker-host>" bun run verify:production-smoke
+```
+
+## GitHub Actions
+
+Pull requests and branch pushes run local verification plus a Worker dry-run build. Pushes to `main` then deploy staging, run the full deployed staging verifier suite, wait for GitHub Environment approval named `production`, deploy the default production Worker, and run the production smoke verifier.
+
+Required GitHub secrets:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `STAGING_NEON_DATABASE_URL`
+- `STAGING_MUSUBI_HOSTED_URL`
+- `PROD_NEON_DATABASE_URL`
+- `PROD_MUSUBI_HOSTED_URL`
+
+CI does not run `wrangler secret put`; configure each Worker's `NEON_DATABASE_URL` secret in Cloudflare before deployment.
 
 Manual Neon checks:
 
