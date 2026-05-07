@@ -5,17 +5,19 @@ import type { GrantedDevice, InvokeOptions, MessageEnvelope, MusubiAppOptions } 
 
 export class MusubiApp {
   readonly apiBaseUrl: string;
-  readonly appId: string;
+  appId: string;
   readonly privateKey: string;
-  readonly workspaceId: string;
+  workspaceId: string;
   readonly appPublicKey: string;
 
-  #apiKey: string;
+  #credential: string;
   #appKeyId: string;
   #pollIntervalMs: number;
+  #identityPromise?: Promise<void>;
 
   devices = {
     listGranted: async () => {
+      await this.#ensureIdentity();
       const response = await this.#requestJson<{ devices: GrantedDevice[] }>("/v1/app/devices");
       return response.devices;
     },
@@ -23,16 +25,18 @@ export class MusubiApp {
 
   constructor(options: MusubiAppOptions) {
     this.apiBaseUrl = options.apiBaseUrl.replace(/\/$/, "");
-    this.appId = options.appId;
-    this.#apiKey = options.apiKey;
+    this.appId = options.appId ?? "";
+    this.#credential = options.apiKey ?? options.appSessionToken ?? "";
+    if (!this.#credential) throw new Error("Musubi app credential required");
     this.privateKey = options.privateKey;
-    this.workspaceId = options.workspaceId ?? "ws_local";
-    this.#appKeyId = options.appKeyId ?? "appkey_001";
+    this.workspaceId = options.workspaceId ?? "";
+    this.#appKeyId = options.appKeyId ?? "";
     this.#pollIntervalMs = options.pollIntervalMs ?? 75;
     this.appPublicKey = publicKeyFromPrivateKey(options.privateKey);
   }
 
   async invoke(options: InvokeOptions): Promise<Invocation> {
+    await this.#ensureIdentity();
     const key = await this.#requestJson<{
       device_key_id: string;
       public_key: string;
@@ -83,12 +87,28 @@ export class MusubiApp {
     });
   }
 
+  async #ensureIdentity(): Promise<void> {
+    if (this.appId && this.#appKeyId && this.workspaceId) return;
+    this.#identityPromise ??= this.#requestJson<{
+      app_id: string;
+      workspace_id: string;
+      active_app_key_id?: string;
+    }>("/v1/app/me").then((identity) => {
+      this.appId ||= identity.app_id;
+      this.workspaceId ||= identity.workspace_id;
+      this.#appKeyId ||= identity.active_app_key_id ?? "";
+    });
+    await this.#identityPromise;
+    if (!this.appId) throw new Error("Musubi app identity missing app_id");
+    if (!this.#appKeyId) throw new Error("Musubi app identity missing active_app_key_id");
+  }
+
   async #requestJson<T>(path: string, options: RequestInit = {}): Promise<T> {
     const response = await fetch(`${this.apiBaseUrl}${path}`, {
       ...options,
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${this.#apiKey}`,
+        Authorization: `Bearer ${this.#credential}`,
         ...(options.headers ?? {}),
       },
     });

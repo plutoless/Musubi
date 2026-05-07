@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { neon } from "@neondatabase/serverless";
-import { MusubiApp, generateX25519KeyPair, hermesPayload } from "../sdk/app-js/src/index.ts";
+import { MusubiApp, createNativeAuthorization, exchangeNativeAuthorizationCode, generateX25519KeyPair, hermesPayload } from "../sdk/app-js/src/index.ts";
 import { loadEnvFiles } from "./env.ts";
 import {
   assertApiKeyList,
@@ -20,6 +20,7 @@ let port = randomPort();
 let serverUrl = `http://127.0.0.1:${port}`;
 const workspaceId = `ws_m4_hosted_local_${Date.now()}`;
 const sql = databaseUrl ? neon(databaseUrl) : undefined;
+let adminCookie = "";
 
 if (import.meta.main) {
   if (!databaseUrl) {
@@ -30,6 +31,7 @@ if (import.meta.main) {
   let worker = startWorker();
   try {
     await waitForHealth();
+    adminCookie = await adminLogin();
     const result = await runHostedFlow(serverUrl, workspaceId);
 
     await stopWorker(worker);
@@ -37,6 +39,7 @@ if (import.meta.main) {
     serverUrl = `http://127.0.0.1:${port}`;
     worker = startWorker();
     await waitForHealth();
+    adminCookie = await adminLogin();
 
     const resumedConsent = await requestJson<any>(`${serverUrl}/v1/consent-requests/${result.consentId}`);
     if (resumedConsent.consent_request.status !== "approved") throw new Error("hosted consent did not survive Worker restart");
@@ -104,6 +107,13 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
   if (!databaseUrl || !sql) {
     throw new Error("NEON_DATABASE_URL is required for hosted M4 verification. Set it in the shell or in .env.local; see .env.example.");
   }
+  const unauthAdmin = await postJsonWithoutAdmin(`${apiBaseUrl}/v1/apps`, {
+    workspace_id: workspace,
+    name: "Unauth Hosted Admin App",
+    type: "first_party",
+  });
+  if (unauthAdmin.status !== 401) throw new Error("hosted unauthenticated app management was not rejected");
+
   const deviceKeys = generateX25519KeyPair();
   const appKeys = generateX25519KeyPair();
   const device = await postJson<any>(`${apiBaseUrl}/v1/devices/register`, {
@@ -156,6 +166,31 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     reason: "Run queued hosted verifier task",
     queueing_requested: true,
   });
+  const hermesSetupOutput = await run("go", [
+    "run", "./cmd/musubi", "developer", "hermes", "setup",
+    "--server", apiBaseUrl,
+    "--home", `${process.cwd()}/.cache/m4-hosted-hermes-${Date.now()}`,
+    "--workspace", workspace,
+    "--developer-name", "Hosted Hermes CLI Developer",
+    "--developer-email", "hosted-hermes@example.test",
+    "--publisher-name", "Hosted Hermes CLI Publisher",
+    "--app-name", "Hosted Hermes CLI Companion",
+  ]);
+  const hermesSetupAppId = hermesSetupOutput.match(/created Hermes third-party app (app_[A-Za-z0-9_-]+)/)?.[1];
+  if (!hermesSetupAppId) throw new Error(`Hermes setup helper did not print app id:\n${hermesSetupOutput}`);
+  const hermesSetupAppDetail = await requestJson<any>(`${apiBaseUrl}/v1/apps/${hermesSetupAppId}`);
+  if (!hermesSetupAppDetail.app?.permission_declarations?.some((declaration: any) =>
+    declaration.plugin_name === "hermes" &&
+    declaration.channels.includes("hermes.task.create") &&
+    declaration.channels.includes("hermes.task.cancel") &&
+    declaration.channels.includes("hermes.task.status")
+  )) {
+    throw new Error("hosted Hermes setup helper did not create Hermes permission declarations");
+  }
+  const hermesSetupApps = await requestJson<any>(`${apiBaseUrl}/v1/apps?type=third_party&workspace_id=${workspace}`);
+  if (!hermesSetupApps.apps.find((row: any) => row.id === hermesSetupAppId && row.permission_declarations?.some((declaration: any) => declaration.plugin_name === "hermes"))) {
+    throw new Error("hosted Hermes setup app list did not expose permission declarations");
+  }
   const extraDeviceKeys = generateX25519KeyPair();
   const secondaryDevice = await postJson<any>(`${apiBaseUrl}/v1/devices/register`, {
     workspace_id: workspace,
@@ -278,6 +313,65 @@ export async function runHostedFlow(apiBaseUrl: string, workspace: string) {
     payload: hermesPayload("HOSTED_M4_ENCRYPTED_PAYLOAD_2"),
   });
   assertMessageDetail(await requestJson<any>(`${apiBaseUrl}/v1/messages/${secondInvocation.messageId}`), secondInvocation.messageId, ["HOSTED_M4_ENCRYPTED_PAYLOAD_2"]);
+
+  const nativeApp = await postJson<any>(`${apiBaseUrl}/v1/apps`, {
+    workspace_id: workspace,
+    name: "Hermes Companion",
+    type: "first_party",
+  });
+  if (nativeApp.app_key_id) throw new Error("hosted native app pre-approval created an app key too early");
+  const nativeKeys = generateX25519KeyPair();
+  const redirectUri = "http://127.0.0.1:55555/callback";
+  const nativeDenied = await postJsonWithStatus(`${apiBaseUrl}/v1/oauth/native/authorize`, {
+    client_id: nativeApp.app_id,
+    workspace_id: workspace,
+    redirect_uri: "http://localhost:55555/callback",
+    code_challenge: "x".repeat(43),
+    code_challenge_method: "S256",
+    requested_capabilities: [{ plugin: "hermes", channels: ["hermes.task.create"] }],
+    app_public_key: nativeKeys.publicKey,
+  });
+  if (nativeDenied.status !== 400) throw new Error("hosted native authorize accepted localhost redirect");
+  const nativeAuth = await createNativeAuthorization({
+    apiBaseUrl,
+    clientId: nativeApp.app_id,
+    workspaceId: workspace,
+    redirectUri,
+    appPublicKey: nativeKeys.publicKey,
+  }) as any;
+  const nativeApproved = await postJson<any>(`${apiBaseUrl}/v1/consent-requests/${nativeAuth.authorization_id}/approve`, {
+    device_id: device.device_id,
+    allowed_channels: ["hermes.task.create", "hermes.task.cancel", "hermes.task.status"],
+  });
+  const nativeCode = new URL(nativeApproved.redirect_uri).searchParams.get("code");
+  if (!nativeCode) throw new Error("hosted native approval did not return code");
+  const nativeToken = await exchangeNativeAuthorizationCode({
+    apiBaseUrl,
+    code: nativeCode,
+    redirectUri,
+    codeVerifier: nativeAuth.codeVerifier,
+  }) as any;
+  if (!nativeToken.access_token?.startsWith("musubi_session_")) throw new Error("hosted native token exchange did not return session token");
+  const nativeAdminDenied = await postJsonWithoutAdmin(`${apiBaseUrl}/v1/apps`, {
+    workspace_id: workspace,
+    name: "Native Session Managed App",
+    type: "first_party",
+  }, nativeToken.access_token);
+  if (nativeAdminDenied.status !== 403) throw new Error("hosted native app session managed admin app resources");
+  const nativeClient = new MusubiApp({
+    apiBaseUrl,
+    appSessionToken: nativeToken.access_token,
+    privateKey: nativeKeys.privateKey,
+  });
+  const nativeDevices = await nativeClient.devices.listGranted();
+  if (!nativeDevices.some((entry: { id: string }) => entry.id === device.device_id)) throw new Error("hosted native session did not list approved device");
+  await postJson(`${apiBaseUrl}/v1/grants/${nativeApproved.grant_id}/revoke`, {});
+  const nativeAfterRevoke = await requestJsonWithBearerStatus(`${apiBaseUrl}/v1/app/devices`, nativeToken.access_token);
+  const revokedDevices = Array.isArray(nativeAfterRevoke.body.devices) ? nativeAfterRevoke.body.devices : [];
+  if (nativeAfterRevoke.status !== 200 || revokedDevices.some((entry: { id: string }) => entry.id === device.device_id)) {
+    throw new Error("hosted native session still listed revoked device");
+  }
+
   const pagedListSeedParams = { requireNextCursor: true };
   await expectPagedList(`${apiBaseUrl}/v1/devices?workspace_id=${workspace}`, "devices", {
     ...pagedListSeedParams,
@@ -500,10 +594,18 @@ async function requestJsonWithApiKey<T>(url: string, apiKey: string): Promise<T>
   return json as T;
 }
 
+async function requestJsonWithBearerStatus(url: string, bearer: string): Promise<{ status: number; body: any }> {
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${bearer}` },
+    signal: AbortSignal.timeout(10_000),
+  });
+  return { status: response.status, body: await response.json().catch(() => ({})) };
+}
+
 async function postJson<T = unknown>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(adminCookie ? { Cookie: adminCookie } : {}) },
     body: JSON.stringify(body),
   });
   const json = await response.json().catch(() => ({}));
@@ -511,15 +613,45 @@ async function postJson<T = unknown>(url: string, body: unknown): Promise<T> {
   return json as T;
 }
 
+async function postJsonWithStatus(url: string, body: unknown): Promise<{ status: number; body: any }> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(adminCookie ? { Cookie: adminCookie } : {}) },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json().catch(() => ({})) };
+}
+
+async function postJsonWithoutAdmin(url: string, body: unknown, bearer?: string): Promise<{ status: number; body: any }> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}) },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json().catch(() => ({})) };
+}
+
 async function patchJson<T = unknown>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(adminCookie ? { Cookie: adminCookie } : {}) },
     body: JSON.stringify(body),
   });
   const json = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(`PATCH ${url} failed: ${response.status} ${JSON.stringify(json)}`);
   return json as T;
+}
+
+async function adminLogin() {
+  const response = await fetch(`${serverUrl}/v1/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "admin", password: "musubi-admin-local" }),
+  });
+  if (!response.ok) throw new Error(`admin login failed: ${response.status} ${await response.text()}`);
+  const cookie = response.headers.get("set-cookie")?.split(";")[0];
+  if (!cookie) throw new Error("admin login did not return cookie");
+  return cookie;
 }
 
 async function run(command: string, args: string[]): Promise<string> {

@@ -293,6 +293,22 @@ The local relay serves the control plane at:
 http://127.0.0.1:8787/control-plane
 ```
 
+The control plane has separate user and admin entry points:
+
+```text
+http://127.0.0.1:8787/control-plane/user
+http://127.0.0.1:8787/control-plane/admin
+```
+
+Local admin credentials are configured with environment variables:
+
+```bash
+MUSUBI_ADMIN_USERNAME=admin
+MUSUBI_ADMIN_PASSWORD=musubi-admin-local
+```
+
+The default password is for local development only. Set a different value in `.env.local` or deployment secrets for any shared environment.
+
 ### M2.5 Codex Adapter Verification
 
 Run the local Codex adapter verifier:

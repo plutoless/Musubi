@@ -37,8 +37,6 @@ export function startHermesCompanion(options: { hostname?: string; port?: number
   const userToken = options.userToken ?? process.env.HERMES_COMPANION_USER_TOKEN ?? "dev-user-token";
   const musubi = options.musubi ?? new MusubiApp({
     apiBaseUrl: requiredEnv("MUSUBI_API_BASE_URL"),
-    appId: requiredEnv("MUSUBI_APP_ID"),
-    appKeyId: process.env.MUSUBI_APP_KEY_ID,
     apiKey: requiredEnv("MUSUBI_API_KEY"),
     privateKey: requiredEnv("MUSUBI_APP_PRIVATE_KEY"),
     workspaceId: process.env.MUSUBI_WORKSPACE_ID ?? "ws_local",

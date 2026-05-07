@@ -82,11 +82,8 @@ try {
 
   const musubi = new MusubiApp({
     apiBaseUrl: relayUrl,
-    appId: sdkEnv.MUSUBI_APP_ID,
-    appKeyId: sdkEnv.MUSUBI_APP_KEY_ID,
     apiKey: sdkEnv.MUSUBI_API_KEY,
     privateKey: sdkEnv.MUSUBI_APP_PRIVATE_KEY,
-    workspaceId: "ws_local",
   });
   companion = startHermesCompanion({
     hostname: "127.0.0.1",

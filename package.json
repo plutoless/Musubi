@@ -35,6 +35,8 @@
     "verify:m2.5-codex": "bun run tools/verify_m2_5_codex_adapter.ts",
     "verify:m3-app-sdk": "bun run tools/verify_m3_app_sdk.ts",
     "verify:m3.5-browser-session": "bun run tools/verify_m3_5_browser_session.ts",
+    "verify:hermes-native-consent": "bun run tools/verify_hermes_native_consent.ts",
+    "verify:user-admin-split": "bun run tools/verify_user_admin_split.ts",
     "verify:m4-platform-trust": "bun run tools/verify_m4_platform_trust.ts",
     "verify:m4-hosted-local": "bun run tools/verify_m4_hosted_local.ts",
     "verify:m4-hosted-deployed": "bun run tools/verify_m4_hosted_deployed.ts",

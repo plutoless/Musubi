@@ -13,8 +13,9 @@ export type MessageState =
 
 export interface MusubiAppOptions {
   apiBaseUrl: string;
-  appId: string;
-  apiKey: string;
+  appId?: string;
+  apiKey?: string;
+  appSessionToken?: string;
   privateKey: string;
   workspaceId?: string;
   appKeyId?: string;
@@ -42,7 +43,7 @@ export interface InvokeOptions {
 export interface MessageEnvelope {
   message_id: string;
   workspace_id: string;
-  app_id: string;
+  app_id?: string;
   device_id: string;
   channel: string;
   visible_metadata: Record<string, string>;

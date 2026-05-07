@@ -18,8 +18,10 @@ await assertArtifacts();
 process.env.MUSUBI_RELAY_STATE_PATH = relayStatePath;
 let server = startRelay({ hostname: "127.0.0.1", port: Number(port) });
 let device: ChildProcessWithoutNullStreams | undefined;
+let adminCookie = "";
 
 try {
+  adminCookie = await adminLogin();
   await run("go", ["run", "./cmd/musubi", "device", "register", "--server", serverUrl, "--home", home, "--workspace", "ws_local", "--name", "M4 Trust Mac"]);
 
   const install = await run("go", ["run", "./cmd/musubi", "plugin", "install", "codex", "--server", serverUrl, "--home", home, "--version", "0.2.5", "--yes"]);
@@ -300,7 +302,7 @@ async function requestJson<T>(url: string): Promise<T> {
 async function postJson<T = unknown>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(adminCookie ? { Cookie: adminCookie } : {}) },
     body: JSON.stringify(body),
   });
   const json = await response.json().catch(() => ({}));
@@ -311,12 +313,24 @@ async function postJson<T = unknown>(url: string, body: unknown): Promise<T> {
 async function patchJson<T = unknown>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(adminCookie ? { Cookie: adminCookie } : {}) },
     body: JSON.stringify(body),
   });
   const json = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(`PATCH ${url} failed: ${response.status} ${JSON.stringify(json)}`);
   return json as T;
+}
+
+async function adminLogin() {
+  const response = await fetch(`${serverUrl}/v1/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "admin", password: "musubi-admin-local" }),
+  });
+  if (!response.ok) throw new Error(`admin login failed: ${response.status} ${await response.text()}`);
+  const cookie = response.headers.get("set-cookie")?.split(";")[0];
+  if (!cookie) throw new Error("admin login did not return cookie");
+  return cookie;
 }
 
 async function run(command: string, args: string[]): Promise<string> {

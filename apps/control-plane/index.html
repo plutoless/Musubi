@@ -7,35 +7,7 @@
     <link rel="stylesheet" href="/control-plane/styles.css" />
   </head>
   <body>
-    <div class="shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <strong>Musubi</strong>
-          <span>Control Plane</span>
-        </div>
-        <nav aria-label="Primary">
-          <a href="#home" data-route="home">Home</a>
-          <a href="#devices" data-route="devices">Devices</a>
-          <a href="#apps" data-route="apps">Apps</a>
-          <a href="#apps/authorized" data-route="apps/authorized">Authorized Apps</a>
-          <a href="#developer" data-route="developer">Developer</a>
-          <a href="#plugins" data-route="plugins">Plugins</a>
-          <a href="#messages" data-route="messages">Messages</a>
-          <a href="#audit" data-route="audit">Audit</a>
-          <a href="#settings" data-route="settings">Settings</a>
-        </nav>
-      </aside>
-      <main>
-        <header class="topbar">
-          <div>
-            <h1 id="page-title">Home</h1>
-            <p id="page-copy">Musubi routes encrypted messages but cannot read task contents.</p>
-          </div>
-          <button id="refresh" type="button" title="Refresh">Refresh</button>
-        </header>
-        <section id="app" class="content" aria-live="polite"></section>
-      </main>
-    </div>
+    <div id="app-root"></div>
     <script type="module" src="/control-plane/app.js"></script>
   </body>
 </html>
