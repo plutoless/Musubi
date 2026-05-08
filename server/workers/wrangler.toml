@@ -2,6 +2,9 @@ name = "musubi-m1"
 main = "src/index.ts"
 compatibility_date = "2026-05-06"
 
+[placement]
+region = "azure:southeastasia"
+
 [assets]
 directory = "../../apps/control-plane"
 binding = "ASSETS"

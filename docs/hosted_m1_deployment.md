@@ -37,6 +37,15 @@ server/workers/src/durable_objects/DeviceSession.ts
 server/workers/wrangler.toml
 ```
 
+The Worker currently uses a Cloudflare Placement Hint to run closer to the Singapore Neon database:
+
+```toml
+[placement]
+region = "azure:southeastasia"
+```
+
+If the database region changes, update the placement hint to match the new database region. Cloudflare Placement runs the Worker in the Cloudflare data center with the lowest latency to the specified cloud region, not literally inside that cloud provider region.
+
 The Worker routes:
 
 - `GET /v1/health`
